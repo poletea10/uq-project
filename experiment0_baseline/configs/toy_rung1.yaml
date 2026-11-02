@@ -1,0 +1,4 @@
+# Toy rung 1 (phase0_protocol.md §2.3): homoscedastic, sigma = sigma_0 everywhere.
+rung: 1
+noise: constant
+log_sigma0: -1.3931471805599454   # -0.7 - log 2, sigma_0 ~ 0.248

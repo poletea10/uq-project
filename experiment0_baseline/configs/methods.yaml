@@ -1,0 +1,13 @@
+# Per-method settings (phase0_protocol.md §5). Library defaults unless stated.
+hgp:                        # PyMC "Sparse Heteroskedastic GP" example (DTC latent GPs for mu and log sigma)
+  n_inducing: 40            # inducing points, evenly spaced on x_range, shared by both latents
+  jitter: 1.0e-6            # pm.gp.util.stabilize default
+  target_accept: 0.95
+  chains: 2
+  tune: 500
+  draws: 250                # chains x draws = S
+  rhat_flag: 1.05
+  log_noise_mean_prior: [-2.0, 2.0]   # constant mean of the log-noise latent g: m_g ~ Normal(mu, sigma), standardized-y units
+
+tabiclv2:
+  checkpoint: /private/groups/ioannidislab/ajaras/tabicl-dev/tabicl-regressor-v2-20260212.ckpt

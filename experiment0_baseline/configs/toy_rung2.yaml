@@ -1,0 +1,8 @@
+# Toy rung 2 (phase0_protocol.md §2.3): heteroscedastic,
+#   sigma(x) = sigma_0 * exp(phi_b * h(x)),  h(x) = logistic((x - a)/w) - logistic((x - b)/w),
+# with [a, b] = noise_strip from toy_function.yaml and w = edge_width.
+rung: 2
+noise: bump
+log_sigma0: -1.3931471805599454   # -0.7 - log 2, sigma_0 ~ 0.248
+phi_b: 1.791759469228055          # log 6: sigma ~ 1.5 inside the noise strip
+edge_width: 0.1

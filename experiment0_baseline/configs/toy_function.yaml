@@ -1,0 +1,31 @@
+# T1 toy set: the curated function f = f_base + f_gap and the geometry shared by all toy rungs
+# (phase0_protocol.md §2.2, §2.4).
+x_range: [-5.0, 5.0]
+
+# f_base: ~2.5-unit wavelength, so ~4 periods over x_range (DEUP: ~3 over 3 units)
+J: 28                         # spacing ≈ 0.4 ≈ 1.4 * bump_width
+bump_width: 0.3
+f_std: 1.0
+
+# f_gap: isolated narrow peaks, spacing ≈ 3 widths, clearly stronger than base
+K: 10
+gap_bump_width: 0.1
+gap_edge_width: 0.05
+gap_std: 1.25                 # ≈ 5 * sigma_0; still above the rung-1 noise floor
+
+# Geometry, shared by all toy rungs (shaded in every figure panel)
+sparse_strip: [1.0, 4.0]
+noise_strip: [-3.5, -1.5]
+gap_density: 0.075            # context density inside sparse_strip, relative to 1 elsewhere: about
+                              # 2 / 8 / 32 gap points at n = 64 / 256 / 1024
+n_query: 200                  # evenly spaced on x_range, shared by all toy rungs and models
+fig_y_lim: [-4.5, 4.5]        # fixed y-limits of row 1 (data and bands) in every context figure; bands may clip
+
+# Pre-registered curation (§2.2): keep the first toy_seed = 0, 1, ... whose f meets all three.
+curation:
+  max_abs_f: 4.0              # max_x |f(x)| <= 4
+  min_gap_sd: 0.5             # s.d. of f_gap over sparse_strip >= 0.5
+  min_noise_strip_range: 1.0  # max - min of f over noise_strip >= 1
+  max_seed: 1000              # give up after this many candidates
+
+toy_seed: 3                # written once by scripts/00_curate_toy.py, then frozen

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iltm2"
+version = "0.0.1"
+description = "iLTMv2 Phase 1: aleatoric / epistemic heads on a frozen TabICLv2 (phase1_design.md, phase1_protocol.md)"
+requires-python = ">=3.10"
+# Dependencies (torch, numpy, tabicl) are managed by the uq-iltm-bio conda env, not by pip:
+#   pip install -e experiment1_uq_heads --no-deps
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

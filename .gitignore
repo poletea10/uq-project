@@ -1,0 +1,6 @@
+# Root-level folders
+/external/
+/SCRAPPED/
+
+# Any folder named outputs/, at any depth
+outputs/

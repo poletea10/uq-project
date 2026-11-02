@@ -1,0 +1,3 @@
+# Toy rung 0 (phase0_protocol.md §2.3): deterministic, sigma == 0, A = 0 exactly.
+rung: 0
+noise: none

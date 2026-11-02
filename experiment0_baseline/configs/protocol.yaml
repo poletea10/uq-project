@@ -1,0 +1,21 @@
+# Frozen protocol constants (phase0_protocol.md §1). Fixed before the first run; never tuned.
+n_grid: [16, 64, 256, 1024]   # context sizes (T1, T2, T3)
+S: 500                        # posterior samples (heteroscedastic GP)
+R_rep: 100                    # replicate draws of y per query (T2); cap on replicates per query (T3)
+n_bins: 20                    # equal-count bins in reliability plots (T2, T3)
+sigma_floor: 1.0e-6           # clip value for every predicted sigma; sigma_floor/sqrt(pi) is the log-plot floor
+base_seed: 0                  # root of every RNG stream (§9)
+
+# Shared t-grid (§4.3)
+t_points: 4096
+t_halfwidth_sd: 10.0          # grid spans +-10 s.d. around the forecast, widened to cover the truth
+tail_tol: 1.0e-4              # both CDFs must be < tail_tol / > 1 - tail_tol at the grid ends
+
+# Backbone check pass criteria (§2.7), fixed before running
+backbone_check:
+  n_eval: [64, 256, 1024]     # criteria are checked at these n
+  fit_ratio_max: 1.5          # 1. mean CRPS outside both strips: TabICLv2 <= 1.5 x heteroscedastic GP
+  locality_ratio_min: 2.0     # 2. toy rung 0: mean e(q) sparse strip >= 2 x outside both strips
+  noise_ratio_min: 2.0        # 3. toy rung 2, n >= noise_n_min: mean e(q) noise strip >= 2 x outside both strips
+  noise_n_min: 256
+  max_failing_n: 1            # criteria 2 and 3 may each fail at no more than this many n
