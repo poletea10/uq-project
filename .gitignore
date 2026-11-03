@@ -4,3 +4,7 @@
 
 # Any folder named outputs/, at any depth
 outputs/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
