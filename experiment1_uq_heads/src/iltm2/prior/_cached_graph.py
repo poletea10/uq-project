@@ -24,8 +24,9 @@ THE FIX
                            weights and `node_importance`; its `_transform` is tabicl's, line for line, with those
                            three replaced by the cached values
       CachedGraphFunction  `RandomGraphFunction` built from `CachedNodeFunction`s, with tabicl's pruning
-    After fitting, a call redraws only the base points at roots: U1 in the X-graph, U2 in the target graph (whose
-    X-input nodes, in `_cut_graph_scm.py`, also use a `RootPointLaw` for their hidden dims).
+    After fitting, a call redraws only the base points at roots: U1 in the X-graph, U2 in the target graph (its
+    private roots; its X-input nodes are non-root nodes whose parent value is the observed block, so they are
+    deterministic functions of X).
 
 TESTING THE FIX: THE TAPE
     Every base-point draw goes through `RootPointLaw.sample`. With `set_tape(laws, "record")` each draw is stored;
@@ -111,18 +112,26 @@ class CachedNodeFunction(RandomNodeFunction):
     tabicl's `_transform`, line for line, with those three replaced by the cached values.
 
     Extras: `out_scale` multiplies the node's output (1.0 = tabicl; the target graph sets it on private roots,
-    a difficulty-match knob). With `keep_writeback = True` the node stores, per extracted column, the block the
+    a difficulty-match knob). `latent_dims_range`, if set on a featureless root, replaces tabicl's LogInt(1, 32)
+    draw of its number of dims (another difficulty-match knob for private roots; None = tabicl). With `keep_writeback = True` the node stores, per extracted column, the block the
     converter wrote back into the node (`writeback_`; used by the exactness test).
     """
 
     def __init__(self, context: Context, feature_specs: Dict[str, FeatureSpec]):
         super().__init__(context, feature_specs)
         self.out_scale = 1.0
+        self.latent_dims_range: Optional[Tuple[int, int]] = None   # roots only: override LogInt(1, 32)
         self.keep_writeback = False
         self.writeback_: Dict[str, torch.Tensor] = {}
 
     def _fit(self, x: List[torch.Tensor], n_samples: int):
         super()._fit(x, n_samples)
+        if self.latent_dims_range is not None and len(x) == 0:
+            # A root without features has n_features_ = its latent dims only; redraw them from the override range
+            # (same sampler name as tabicl's draw). Used for the target graph's private roots (difficulty knob).
+            assert not self.converters_, "the latent-dims override is for featureless roots"
+            lo, hi = self.latent_dims_range
+            self.n_features_ = self.sampler.randint("node_n_latent_features", lo, hi, use_log=True)
         if self.config.add_gaussian_noise:
             raise NotImplementedError("node noise would also need its sigma cached; it is off in every v2 recipe")
         self.root_law_ = RootPointLaw(self.context, self.n_features_) if len(x) == 0 else None

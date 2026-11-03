@@ -63,7 +63,7 @@ $$
 $$
 
 - **Raw squared error only.** Never clip $\hat t_E$ at zero, even though single targets can be negative. All of these break the conditional-mean argument of §2.4.
-- **Start with $R=16$.** Each extra replicate costs one more tiled row in the target graph's single pass. More replicates do not move the optimum; they cut target variance, mostly for $\hat t_E$, which is a difference of two noisy terms. Lower $R$ only if target generation becomes the bottleneck.
+- **Start with $R=16$.** Each extra replicate costs one more pass of the target graph over the query rows. More replicates do not move the optimum; they cut target variance, mostly for $\hat t_E$, which is a difference of two noisy terms. Lower $R$ only if target generation becomes the bottleneck.
 - **One CDF convention throughout.** Compute $e(q_\theta)$, $S(q_\theta,y^{(r)})$ and the grading of Phase 0 (`phase0_protocol.md` §5.4) from the same CDF built from the quantiles (tails or no tails). Otherwise $\hat r$ picks up a constant offset.
 
 ## 3. Loss
@@ -178,7 +178,43 @@ We keep the same logic: an infinite stream of fresh tasks, a fixed step budget, 
 
 ## 1. Task construction (one training task)
 
-All tasks come from the **observed-cut prior** (proposal §4.3, code in `src/iltm2/prior/_cut_graph_scm.py`): X comes from an X-graph with `graph_scm`'s mechanism (no y node), and y comes from a second, `graph_scm`-style target graph (same DAG sampler, 2–32 nodes, same node functions). Its X-input nodes are a random subset of the X-graph's feature-hosting nodes, each carrying the observed post-converter values of its columns plus fresh hidden dims; its other roots are private noise roots. Hidden dims and private roots are $U_2$, redrawn per replicate. X's distribution is close to, but not identical to, the pretraining prior's (proposal §4.3, "Not identical"). Because y is produced only after X is fixed, **we build the whole split on X first and draw y last.**
+All tasks come from the **observed-cut prior** (proposal §4.3; code in `src/iltm2/prior/`, mainly `_cut_graph_scm.py`), described below. Because y is produced only after X is fixed, **we build the whole split on X first and draw y last.**
+
+### The observed-cut prior: what we changed from `graph_scm`
+
+**The original prior.** TabICLv2 was pretrained only on `graph_scm`. Per dataset it samples a random DAG (Cauchy edge model, 2–32 nodes), puts random-point vectors at the root nodes and pushes them through random node functions (MLPs, trees, GPs, discretizations, …). Each node is a vector of LogInt(1, 32) latent dims plus the dims its converters read; features and the target y are read from random nodes by converters (numerical, with optional warping, or categorical). There is no node noise (`graph_noise False`): all aleatoric spread is omitted-variable noise, the dimensions upstream of y that the features do not pin down. A dataset is then post-processed (outlier clamp, standardization) and filtered (graph check, constant columns, ExtraTrees predictability test).
+
+**Why it cannot be used as is.** X and y share upstream randomness U, so an exact replicate of y at a fixed x needs U from the abduction posterior $p(U\mid\Phi(U)=x)$, which these dense nonlinear graphs make intractable (proposal §4.3, CLAUDE.md "abduction rule").
+
+**What we changed.** Each change is the smallest one that makes replicates exact or brings the cut's difficulty back to `graph_scm`'s.
+
+| # | Change | Why |
+|---|---|---|
+| 1 | **The cut.** X comes from an X-graph with `graph_scm`'s mechanism but no y node. y comes from a second, `graph_scm`-style **target graph** (same DAG sampler and size range, same node functions): $y=\Psi(X_{\text{obs}},U_2)$, $U_1\perp U_2$. | Nothing has to be inferred from X: a replicate is "hold X, redraw $U_2$, rerun Ψ". |
+| 2 | **X enters as a parent value.** The target graph's X-input nodes are a random subset of the X-graph's feature-hosting nodes, placed on random DAG positions whose incoming edges are cut. The observed post-converter values of a host's columns are the node's parent value; the node is an ordinary non-root `graph_scm` node (`RandomMultiFunction` of the block, LogInt(1, 32) latent dims, std → importance weights → L2 → node importance), so it is a deterministic function of X. | Randomness enters only at roots, as in `graph_scm`. An earlier version added fresh noise dims to X-input nodes; it made cut tasks far noisier (first gate run: median ExtraTrees $R^2$ 0.44 vs 0.92, 52% rejections). |
+| 3 | **Observed values only; the `*_id` write-back is taken out.** X-input values are recomputed from the observed, outlier-clamped columns. For the categorical modes `neighbor_id` and `softmax_id`, whose write-back is the continuous latent (not determined by the observed category), the category's center / embedding is used instead. | y may depend on $U_1$ only through what the model sees; otherwise replicates are not i.i.d. draws from $p(y\mid x)$. |
+| 4 | **No noise-ancestor check.** Only the proposal's graph check remains (an X input is an ancestor of y). When no private root is an ancestor of y, the task is exactly deterministic ($A=0$ at every x). | Requiring a private root to reach y forced irreducible noise into every task and removed `graph_scm`'s near-deterministic mass (median ExtraTrees $R^2$ 0.26–0.56 with the check, 0.92–0.94 without). About 60% of accepted stage-1 tasks are exactly deterministic. |
+| 5 | **Lower private-root noise scale:** private roots' outputs × 0.1 (`private_root_scale`, i.e. a 10× smaller node importance). | Private roots are $U_2$, the only randomness; X never sees them, so their whole effect on y is irreducible. The scale lowers it. |
+| 6 | **Lower private-root dimension:** LogInt(1, 16) dims instead of LogInt(1, 32) (`private_root_dims_range`). | Tree-type node functions split on random points of the data, so they are blind to an input's scale; fewer noise dims also weakens private roots there. With 5 alone the rejection rate stayed at 35%; with 5 + 6 it fell to 25%. |
+
+Two implementation details keep the replicates exact: replicates are drawn as **R separate passes over the same rows**, so the $U_2$-independent part of y is bit-identical across replicates (a single pass over tiled rows let float32 round-off, amplified by tree splits and argmins, put spurious spread of up to 0.2 std(y) on deterministic tasks); and tasks whose target-graph inputs, $y^{(0)}$ or replicates are non-finite are rejected.
+
+**How the cut is checked against `graph_scm`: the difficulty-match gate** (`scripts/00f_difficulty_match.py`, §1.4). It generates matched pairs of cut and unmodified `graph_scm` tasks (same N, $n_{\text{ctx}}$, d; plain i.i.d. split; `graph_scm` with TabICLv2's pretraining config) and requires, per stage: (1) a cut rejection rate in 5–30%; (2) a matching **difficulty profile**: ExtraTrees held-out $R^2$ quantiles q10–q90 within 0.10 of `graph_scm`'s; (3) an **in-domain check**: in 4 equal-count bins of ExtraTrees $R^2$, the median of $R^2(\text{TabICLv2}) - R^2(\text{ExtraTrees})$ agrees between the priors (within 0.05 or overlapping bootstrap 95% CIs; top, saturated bin not gated). Item 3 compares the backbone's advantage over a prior-free model at the same difficulty: a harder slice of the prior keeps it, a slice outside the backbone's domain loses it. The cut also reports an $R^2$ ceiling $1-\mathbb E[\operatorname{Var}(y\mid x)]/\operatorname{Var}(y)$ from its replicates, which splits its difficulty into noise (low ceiling) and complexity (ceiling far above ExtraTrees $R^2$).
+
+**Result for this design (stage 1, 256 pairs; job 45910541):**
+
+| Measure | Cut | `graph_scm` |
+|---|---|---|
+| Rejection rate | **29.3%** (106/362; 47.4% of attempts with a private-root ancestor of y, 8.3% of deterministic ones) | 19.7% |
+| ExtraTrees $R^2$ q10 / q25 / q50 / q75 / q90 | 0.061 / 0.414 / 0.881 / 0.996 / 1.000 | 0.156 / 0.570 / 0.926 / 0.999 / 1.000 |
+| Quantile difference (cut − `graph_scm`) | **−0.095 / −0.156 / −0.044 / −0.003 / +0.000** | |
+| In-domain check | all 3 gated bins agree | |
+| Exactly deterministic tasks | 46.4% of attempts, 60.2% of accepted tasks | – |
+| $\hat t_A$ zero-mass fraction ($R=16$) | **62.5% of queries**; 63% of tasks have $\hat t_A\equiv0$ | – |
+| $\hat t_A$ q10 / q25 / q50 / q75 / q90 | **0 / 0 / 0 / 0.051 / 0.377** | – |
+| $R^2$ ceiling q10 / q50; share ≥ 0.9 | 0.35 / 1.00; 77.7% | – |
+
+The design passes the rejection-rate and in-domain checks. The difficulty profile is within 0.10 at every quantile except q25 (−0.156): cut tasks are slightly harder in the lower-middle of the distribution, with matching medians and upper tail. This deviation was **accepted**: TabICLv2's advantage over ExtraTrees at matched difficulty is the same on both priors, so the cut stays inside the backbone's domain, and the large exactly-deterministic share is acceptable for the heads (it is the $A=0$ end they must learn). The zero-mass fraction above was measured before the separate-pass fix; regenerating the same tasks after the fix gives 63% of tasks with $\hat t_A\equiv0$ and no deterministic task with $\hat t_A>0$. Stage 2 and stage 3 results are added when that run finishes (preliminary stage-2 cut rejection rate: 34.7%).
 
 ### Fixed sizes
 
@@ -233,7 +269,7 @@ Each task's $m$ queries mix three types. They are built from the pool of $P$ row
 | Type | Default share | Construction (rows left after the step) |
 |---|---|---|
 | **Extrapolation** | 15% | **1.** Draw a random unit direction $u$ in standardized X space and score all $P$ rows by $s_i=u^\top x_i$.<br>**2.** The $T$ rows with the largest $s_i$ are the **tail**; remove them from the pool.<br>**3.** From those $T$ tail rows, select $m_{\text{ext}}$ uniformly at random as extrapolation queries; discard the other $T-m_{\text{ext}}$.<br>*Left:* $P-T$ rows. |
-| **kNN hole** | 15% | **1.** Pick a random centre row among the $P-T$ remaining rows.<br>**2.** The centre and its nearest neighbours, $k$ rows in total (standardized X; FAISS for stages 2–3), are the **hole**; remove them from the pool.<br>**3.** From those $k$ hole rows, select $m_{\text{hole}}$ uniformly at random as hole queries; discard the other $k-m_{\text{hole}}$.<br>*Left:* $P-T-k$ rows. |
+| **kNN hole** | 15% | **1.** Pick a random centre row among the $P-T$ remaining rows.<br>**2.** The centre and its nearest neighbours, $k$ rows in total (standardized X; a single centre, so one distance computation over the remaining rows, fast even for stage-3 pools), are the **hole**; remove them from the pool.<br>**3.** From those $k$ hole rows, select $m_{\text{hole}}$ uniformly at random as hole queries; discard the other $k-m_{\text{hole}}$.<br>*Left:* $P-T-k$ rows. |
 | **i.i.d.** | 70% | **1.** The $P-T-k=N-m_{\text{ext}}-m_{\text{hole}}=n_{\text{ctx}}+m_{\text{iid}}$ remaining rows are an ordinary i.i.d. pool.<br>**2.** Select $m_{\text{iid}}$ of them uniformly at random as i.i.d. queries, exactly TabICLv2's random split.<br>**3.** The rest are the **context**: exactly $n_{\text{ctx}}$ rows.<br>*Left:* nothing. |
 
 **Bookkeeping.** Queries $=m_{\text{ext}}+m_{\text{hole}}+m_{\text{iid}}=m$; context $=n_{\text{ctx}}$; discarded $=(T-m_{\text{ext}})+(k-m_{\text{hole}})=P-N$. The model sees exactly $N=n_{\text{ctx}}+m$ rows.
@@ -254,7 +290,7 @@ After the split, 5% of query slots (chosen uniformly across all three types) get
 
 ```text
 query_mix      = [p_iid, p_hole, p_extrap]   # default [0.70, 0.15, 0.15], must sum to 1
-dup_fraction   = 0.05                         # share of query slots overwritten with context x
+dup_fraction   = 0.05                         # share of query slots overwritten with context x (CutGraphConfig)
 R              = 16                           # training replicates per query
 ```
 
@@ -277,7 +313,7 @@ TabICLv2 pretrains only on tasks that pass its filters (TabICLv2 §3 "Data filte
 - **Log the rejection rate** per stage (TabICLv2: about 25% in stage 1). The private noise of the observed cut can make tasks noisier than the original prior and raise it. If it is much higher, tune the y-graph's noise scale, not the filter: the filter defines the backbone's prior.
 - **Known consequence.** The test removes near-unpredictable tasks, truncating the high-aleatoric tail (proposal §4.3, "Known caveat"). Neither the heads nor the backbone see tasks where y barely depends on X. The empirical distribution of $\hat t_A$ is logged.
 - **Same filter everywhere.** The validation bank and the T2 test bank use the same filter, so every grade is on the backbone's prior.
-- **Difficulty-match gate (prior level).** Before training, matched banks of cut tasks and unmodified `graph_scm` tasks (same N, $n_{\text{ctx}}$, d; plain i.i.d. split) are compared on frozen TabICLv2 CRPS and ExtraTrees held-out $R^2$, together with both priors' rejection rates (`scripts/00f_difficulty_match.py`). If the cut is much easier or much harder, tune the target graph (`hidden_dims_range`, `hidden_scale`, `private_root_scale`), never the filters. Proposed pass rule, per stage: median CRPS ratio in [0.8, 1.25], |Δ median $R^2$| ≤ 0.05. The final configuration and tolerance are recorded here once the gate has run.
+- **Difficulty-match gate (prior level).** Before training, matched banks of cut and unmodified `graph_scm` tasks are compared (`scripts/00f_difficulty_match.py`); if the cut drifts from `graph_scm`, tune the target graph's private-root noise (`private_root_scale`, `private_root_dims_range`), never the filters. The pass rule, the calibrated configuration and its results are in "The observed-cut prior" above.
 
 ## 2. Curriculum, batch, and optimization
 

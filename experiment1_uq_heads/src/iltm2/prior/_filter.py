@@ -43,8 +43,10 @@ from tabicl.prior.graph_lib._config import PriorConfig
 from tabicl.prior.graph_lib._dataset import check_x_y_ancestors_overlap
 
 # Rejection reasons, in the order the checks run. Graph resamples are counted separately (not a task rejection).
+# "non_finite" is used only for unmodified graph_scm tasks (scripts/00f_difficulty_match.py): GraphSCM's NaN guard
+# replaces a dataset with a NaN in X or y by a constant one, so it cannot tell which side was non-finite.
 REASONS = ("non_finite_x", "x_scaling_clip", "constant_columns", "non_finite_y", "unpredictable",
-           "non_finite_replicate")
+           "non_finite_replicate", "non_finite")
 
 
 # ------------------------------------------------------------------------------------------- graph check
@@ -98,21 +100,20 @@ def drop_constant_columns(X: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------------------------------------------------- predictability test
 
 
-def predictability_rejects(X: torch.Tensor, y: torch.Tensor, prior_config: PriorConfig, n_rows: Optional[int] = None,
-                           rng: Optional[np.random.Generator] = None) -> bool:
-    """True if TabICLv2's predictability test rejects the task (y, X) .
+def predictability_rejects(X: torch.Tensor, y: torch.Tensor, prior_config: PriorConfig,
+                           n_rows: Optional[int] = None) -> bool:
+    """True if TabICLv2's predictability test rejects the task (X, y).
 
     Runs tabicl's `should_filter` unchanged: ExtraTrees (25 trees, depth 6, bootstrap) is fitted, and the task is
     rejected unless its out-of-bag MSE beats the mean-label baseline on >= 95% of 200 bootstrap resamples. The
     trivial-task test is forced off and the predictability test forced on, whatever `prior_config` says.
 
     TabICLv2 tests datasets of N rows; our pool has P >= N rows (the extra rows feed the hole and the tail). So,
-    when `n_rows` is given, the test runs on `n_rows` rows drawn uniformly without replacement from the pool
-    (`rng`, or the global numpy RNG, which `task_rng` seeds).
+    when `n_rows` is given, the test runs on `n_rows` rows drawn uniformly without replacement from the pool, with
+    the global numpy RNG (which `task_rng` seeds).
     """
     if n_rows is not None and n_rows < X.shape[0]:
-        draw = rng.choice if rng is not None else np.random.choice
-        rows = torch.from_numpy(np.sort(draw(X.shape[0], size=n_rows, replace=False)))
+        rows = torch.from_numpy(np.sort(np.random.choice(X.shape[0], size=n_rows, replace=False)))
         X, y = X[rows], y[rows]
     cfg = replace(prior_config, filter_unpredictable_datasets=True, remove_trivial_datasets=False)
     return bool(should_filter(X, y, cfg, is_classif=False))
@@ -137,10 +138,43 @@ class RejectionLog:
     accepted: int = 0
     rejected: Counter = field(default_factory=Counter)
     graph_resamples: int = 0
+    # Observed-cut attempts split by whether the target graph's y has a private root among its ancestors ("noisy")
+    # or not ("deterministic": y is an exact function of X). Keys "noisy_accepted", "noisy_rejected",
+    # "deterministic_accepted", "deterministic_rejected". Empty for graph_scm tasks.
+    by_noise: Counter = field(default_factory=Counter)
 
-    def reject(self, reason: str):
+    def reject(self, reason: str, noisy: Optional[bool] = None):
         assert reason in REASONS, f"unknown rejection reason {reason!r}"
         self.rejected[reason] += 1
+        if noisy is not None:
+            self.by_noise[f"{'noisy' if noisy else 'deterministic'}_rejected"] += 1
+
+    def accept(self, noisy: Optional[bool] = None):
+        self.accepted += 1
+        if noisy is not None:
+            self.by_noise[f"{'noisy' if noisy else 'deterministic'}_accepted"] += 1
+
+    def revoke(self, reason: str, noisy: Optional[bool] = None):
+        """Turn an accepted task into a rejection: a check that runs after acceptance failed (a non-finite
+        replicate, design §1.4, is only seen when the replicates are drawn after the split). The task is redrawn by
+        the caller."""
+        assert self.accepted > 0
+        self.accepted -= 1
+        if noisy is not None:
+            self.by_noise[f"{'noisy' if noisy else 'deterministic'}_accepted"] -= 1
+        self.reject(reason, noisy)
+
+    def split(self, kind: str) -> Dict[str, float]:
+        """Attempts, rejection rate and accepted count among "noisy" or "deterministic" cut attempts."""
+        acc, rej = self.by_noise[f"{kind}_accepted"], self.by_noise[f"{kind}_rejected"]
+        return dict(attempts=acc + rej, accepted=acc, rate=rej / max(1, acc + rej))
+
+    @property
+    def deterministic_fraction(self) -> float:
+        """Share of cut attempts (target graphs drawn and passing the graph check) whose y has no private-root
+        ancestor, i.e. exactly deterministic tasks."""
+        n_det, n_noisy = self.split("deterministic")["attempts"], self.split("noisy")["attempts"]
+        return n_det / max(1, n_det + n_noisy)
 
     @property
     def attempts(self) -> int:
@@ -154,6 +188,7 @@ class RejectionLog:
         self.accepted += other.accepted
         self.rejected += other.rejected
         self.graph_resamples += other.graph_resamples
+        self.by_noise += other.by_noise
         return self
 
     def summary(self) -> str:

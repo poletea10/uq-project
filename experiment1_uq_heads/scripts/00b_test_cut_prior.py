@@ -16,7 +16,7 @@ HOW
     Small tasks (stage-1 shapes cut down to N = 256, d = 6) so the gate runs in minutes on CPU. The checks follow
     protocol §4.2 and add the ones the new target-graph design needs:
       1. caching: everything but the noise is cached (replay test);
-      2. X is bit-identical across replicates, and one tiled pass equals R separate passes;
+      2. X is bit-identical across replicates, and replicates differ only through U2 (bit-identical otherwise);
       3. exactness: the target graph sees only observed values;
       4. structure of the target graph;
       5. g is fitted once and applied unchanged;
@@ -45,7 +45,7 @@ from tabicl.prior.graph_lib._base import Context
 from tabicl.prior.graph_lib._converter import CategoricalConverter, NumericalConverter
 
 from iltm2.prior._cached_graph import set_tape
-from iltm2.prior._cut_graph_scm import (CutGraphConfig, CutGraphSCM, InputNodeFunction, XGraph, observed_writeback,
+from iltm2.prior._cut_graph_scm import (CutGraphConfig, CutGraphSCM, XGraph, _same_bits, observed_writeback,
                                         v2_prior_config)
 from iltm2.prior._dataset import STAGES, STREAM_REPLICATES, sample_task, sample_task_shape, task_rng
 from iltm2.prior._postprocess import RobustClamp, YTransform
@@ -80,6 +80,16 @@ def small_task(task_idx, seed=0, cfg=CFG, d=D, cat_sizes=None):
     return task, log
 
 
+def noisy_task(start_idx):
+    """The first small task from `start_idx` on whose y has a private-root ancestor (so its replicates carry noise).
+    About 40% of accepted tasks are noisy; the others are exactly deterministic (no private root reaches y)."""
+    for t in range(start_idx, start_idx + 100):
+        task, log = small_task(t)
+        if task.target.n_private_roots_used > 0:
+            return task, log, t
+    raise RuntimeError("no noisy task found")
+
+
 # ------------------------------------------------------------------------------------------- 1. caching
 # Proposal §4.3 / CLAUDE.md gotcha: as shipped, every call of a graph_lib graph function redraws the root point
 # law, the feature-importance weights and node_importance, so a second call is a different task. `CachedNodeFunction`
@@ -108,8 +118,8 @@ def test_caching():
           torch.equal(a, b), f"({len(xg.laws())} root laws)")
     check("X-graph: fresh base points give different X", not torch.equal(a, c))
 
-    # Target graph: its noise sources are the private roots and the hidden dims of X-input nodes (both U2).
-    task, _ = small_task(0)
+    # Target graph: its only noise sources are its private roots (U2); X-input nodes are deterministic in X.
+    task, _, _ = noisy_task(0)
     tg = task.target
     inputs = tg.observed_inputs(task.x_clamped[:64], task.x_graph.col_index)
     set_tape(tg.laws(), "record")
@@ -119,23 +129,23 @@ def test_caching():
     y2 = tg.sample(inputs, 64)
     set_tape(tg.laws(), None)
     y3 = tg.sample(inputs, 64)
-    n_hidden = sum(isinstance(tg.nodes_[i], InputNodeFunction) for i in tg.needed_)
     check("target graph: replaying U2 under another RNG state reproduces y bit for bit", torch.equal(y1, y2),
-          f"({len(tg.laws())} U2 sources: {n_hidden} hidden-dim blocks, {tg.n_private_roots_used} private roots)")
+          f"({len(tg.laws())} U2 sources = {tg.n_private_roots_used} private roots reaching y)")
     check("target graph: fresh U2 gives different y (the replicates carry noise)", not torch.equal(y1, y3))
 
 
 # ------------------------------------------------------------------------------------------- 2. replicates
 # Replication = hold X, redraw U2, rerun the target graph (proposal §4.3). "Assert bit-identical X across
-# replicates" is the construction's only correctness guard: `TargetGraph.sample` snapshots the tiled inputs and
-# checks them after the pass, and `CutGraphTask.replicates` checks the task's X.
+# replicates" is the construction's only correctness guard: `TargetGraph.sample` snapshots the inputs and checks
+# them after every replicate pass, and `CutGraphTask.replicates` checks the task's X. The R replicates are R
+# separate passes over the same rows, so everything that does not depend on U2 must come out bit-identical.
 
 
 def test_replicates():
-    print("\n# 2. replicates: X bit-identical across replicates, one tiled pass = R separate passes")
-    task, _ = small_task(1)
+    print("\n# 2. replicates: X bit-identical across replicates; replicates differ only through U2")
+    task, _, t1 = noisy_task(1)
     rows = torch.arange(task.shape.n_ctx, task.shape.N)    # any pool rows will do
-    with task_rng(0, 0, 1, STREAM_REPLICATES):
+    with task_rng(0, 0, t1, STREAM_REPLICATES):
         Y = task.replicates(rows, 8)
     check("replicates run with the X guard on and return (rows, R) finite values",
           Y.shape == (len(rows), 8) and all_finite(Y), f"shape {tuple(Y.shape)}")
@@ -145,9 +155,9 @@ def test_replicates():
     p = next(i for i in tg.input_hosts if i in tg.needed_)
     node, orig = tg.nodes_[p], tg.nodes_[p]._transform
 
-    def mutate(obs, n):
-        obs.add_(1.0)
-        return orig(obs, n)
+    def mutate(parents, n):                                  # an X-input node's parent list is [observed block]
+        parents[0].add_(1.0)
+        return orig(parents, n)
 
     node._transform = mutate
     try:
@@ -159,22 +169,44 @@ def test_replicates():
         del node._transform
     check("the X guard fires when a node modifies X in place", fired)
 
-    # One tiled pass vs R separate passes on the same U2. The tiled pass draws base points for R*n rows at once;
-    # splitting each recorded draw into its R row blocks and replaying them one pass at a time must give the
-    # same y. This holds only if every node function acts row-wise after fitting, which the tiling relies on.
+    # The guard compares bits (`_same_bits`), not values: torch.equal says NaN != NaN, so a block holding a NaN would
+    # trip a value-based guard although nothing changed (the cause of the first 00f crash).
+    a = torch.tensor([1.0, float("nan"), 3.0])
+    check("the X guard's bitwise comparison treats an untouched NaN as unchanged and still sees real changes",
+          _same_bits(a, a.clone()) and not torch.equal(a, a.clone()) and not _same_bits(a, a + 1.0))
+
+    # Replicates differ ONLY through U2. Record the base points of one pass, then replay that same U2 draw in all R
+    # passes: every replicate must equal the recorded one bit for bit. Any other source of variation between passes
+    # (an uncached statistic, or float32 round-off that depends on a row's position in the batch, which a single
+    # pass over tiled rows had) would show up here.
     n, R = 40, 5
     inputs = tg.observed_inputs(task.x_clamped[:n], task.x_graph.col_index)
     set_tape(tg.laws(), "record")
-    y_tiled = tg.sample(inputs, n, R)
+    y1 = tg.sample(inputs, n, 1)[:, 0]
     for law in tg.laws():
-        base = law.tape[0]
-        law.tape = [base[r * n:(r + 1) * n] for r in range(R)]
+        law.tape = [law.tape[0].clone() for _ in range(R)]
     set_tape(tg.laws(), "replay")
-    y_sep = torch.stack([tg.sample(inputs, n, 1)[:, 0] for _ in range(R)], dim=1)
+    Y_same_u2 = tg.sample(inputs, n, R)
     set_tape(tg.laws(), None)
-    err = float((y_tiled - y_sep).abs().max() / y_tiled.abs().max().clamp(min=1e-12))
-    check("one tiled pass equals R separate passes given the same U2 (row-wise node functions)", err < 1e-5,
-          f"max rel diff {err:.1e}")
+    check("with the same U2 in every pass, the R replicates are bit-identical (they differ only through U2)",
+          all(torch.equal(Y_same_u2[:, r], y1) for r in range(R)))
+
+    # Exactly deterministic tasks (no private root among y's ancestors, about 60% of tasks) have no
+    # U2 at all: their replicates must be bit-identical and t_A must be exactly 0 at every query. With one tiled
+    # pass, float32 round-off amplified by discontinuous node functions gave t_A up to 0.2 std(y) on such tasks.
+    n_det, n_exact = 0, 0
+    for t in range(40):
+        task_d, _ = small_task(300 + t)
+        if task_d.target.n_private_roots_used > 0:
+            continue
+        n_det += 1
+        with task_rng(0, 0, 300 + t, STREAM_REPLICATES):
+            Yd = task_d.replicates(torch.arange(task_d.shape.N), 16)
+        n_exact += bool(torch.equal(Yd, Yd[:, :1].expand_as(Yd)))
+        if n_det == 8:
+            break
+    check("deterministic tasks (no private-root ancestor of y): all 16 replicates bit-identical, t_A = 0 exactly",
+          n_det > 0 and n_exact == n_det, f"{n_exact}/{n_det} tasks")
 
 
 # ------------------------------------------------------------------------------------------- 3. exactness
@@ -251,13 +283,16 @@ def test_exactness():
 
 # ------------------------------------------------------------------------------------------- 4. structure
 # The target graph copies graph_scm's DAG sampler; X-input nodes sit on random positions with their incoming edges
-# cut; y sits on a non-input node; the graph check (some X input is an ancestor of y) holds; and because X-input
-# nodes carry hidden U2 dims, private noise always reaches y. Only y's ancestors are evaluated.
+# cut and are ordinary non-root nodes whose parent value is the observed block, so they are deterministic functions
+# of X; y sits on a non-input node; the graph check (some X input is an ancestor of y) holds; the private roots (the
+# only randomness) carry the calibrated noise (output scale `private_root_scale`, dims in `private_root_dims_range`).
+# Only y's ancestors are evaluated.
 
 
 def test_structure():
     print("\n# 4. target-graph structure (12 tasks)")
-    ok = dict(roots=True, y_off_input=True, check=True, noise=True, prune=True, hosts=True, width=True)
+    ok = dict(roots=True, y_off_input=True, check=True, noise=True, prune=True, hosts=True, width=True,
+              determ=True)
     sizes = []
     for t in range(12):
         task, _ = small_task(100 + t)
@@ -266,17 +301,27 @@ def test_structure():
         ok["roots"] &= all(tg.dag[p] == [] for p in pos)
         ok["y_off_input"] &= tg.y_node not in pos
         ok["check"] &= graph_check(tg.dag, pos, tg.y_node) and any(p in tg.needed_ for p in pos)
-        ok["noise"] &= any(isinstance(tg.nodes_[i], InputNodeFunction) for i in tg.needed_)
+        lo, hi = CFG.private_root_dims_range
+        roots = [tg.nodes_[i] for i in tg.needed_ if i not in tg.input_hosts and not tg.dag[i]]
+        ok["noise"] &= all(nd.out_scale == CFG.private_root_scale and lo <= nd.n_features_ < hi for nd in roots)
         ok["prune"] &= tg.needed_ == ancestors(tg.dag, tg.y_node)
         ok["hosts"] &= len({h.node for h in tg.input_hosts.values()}) == len(pos)
         blocks = tg.observed_inputs(task.x_clamped[:5], task.x_graph.col_index)
         ok["width"] &= all(blocks[p].shape[1] == sum(c.get_n_features() for c in tg.input_hosts[p].converters)
                            for p in blocks)
+        # No randomness at X-input nodes: calling one twice on the same block, without any replay, is bit-identical,
+        # and it has no root law (its parent value is the observed block, so tabicl's non-root branch runs).
+        for p in blocks:
+            nd = tg.nodes_[p]
+            ok["determ"] &= nd.root_law_ is None and torch.equal(nd([blocks[p]], 5)[0], nd([blocks[p]], 5)[0])
         sizes.append(task.diagnostics["y_ancestor_size"])
     check("X-input positions have no parents (incoming edges cut)", ok["roots"])
     check("y sits on a non-input node", ok["y_off_input"])
     check("graph check holds: an X-input node is an ancestor of y", ok["check"])
-    check("private noise reaches y (an X-input node with hidden U2 dims is an ancestor of y)", ok["noise"])
+    check(f"private roots carry the calibrated noise (output scale {CFG.private_root_scale}, "
+          f"dims in [{CFG.private_root_dims_range[0]}, {CFG.private_root_dims_range[1]}))", ok["noise"])
+    check("X-input nodes are deterministic functions of the observed block (no root law, repeat calls equal)",
+          ok["determ"])
     check("only ancestors of y are evaluated (pruning)", ok["prune"])
     check("each X-input node is a distinct feature-hosting node of the X-graph", ok["hosts"])
     check("an X-input block has the width its host's converters occupy", ok["width"],
@@ -299,13 +344,13 @@ def test_g():
     check("YTransform.fit/apply reproduces tabicl's standard_scaling(outlier_removing(y)) bit for bit",
           torch.equal(YTransform.fit(y).apply(y), ref))
 
-    task, _ = small_task(4)
+    task, _, t4 = noisy_task(4)
     check("the task's y0 is g(y0_raw) with g fitted on the pool", torch.equal(task.y0, task.g.apply(task.y0_raw)))
     rows = torch.arange(task.shape.n_ctx, task.shape.N)
     inputs = task.target.observed_inputs(task.x_clamped[rows], task.x_graph.col_index)
-    with task_rng(0, 0, 4, STREAM_REPLICATES):
+    with task_rng(0, 0, t4, STREAM_REPLICATES):
         raw = task.target.sample(inputs, len(rows), 8)
-    with task_rng(0, 0, 4, STREAM_REPLICATES):
+    with task_rng(0, 0, t4, STREAM_REPLICATES):
         reps = task.replicates(rows, 8)
     refit = YTransform.fit(raw).apply(raw)
     check("replicates use the pool's g (bit-equal to g.apply on the raw draws) and differ from a refit",
@@ -386,13 +431,18 @@ def test_filters_and_shapes():
     check("task shapes: N = n_ctx + m, m = m_ext + m_hole + m_iid, P = N + (T - m_ext) + (k - m_hole), "
           "region and feature bounds (900 shapes, 3 stages)", bad == 0, f"{bad} bad")
 
-    # End to end: an accepted task has the documented shapes and a standardized y0.
+    # End to end: an accepted task has the documented shapes and a standardized y0. "Standardized" means std 1,
+    # except when y^(0) is nearly constant: tabicl's standard_scaling floors the std at 1e-6, so a raw std below
+    # that leaves g(y^(0)) with std < 1 (tabicl's own pipeline does the same on such a dataset; section 5 checks
+    # that g reproduces it bit for bit).
     task, log = small_task(5)
     P = task.shape.P
+    floored = float(task.g.scale.std) <= 1e-6
     ok = (task.X.shape == (P, task.diagnostics["d_kept"]) and task.y0.shape == (P,) and all_finite(task.X, task.y0)
-          and abs(float(task.y0.mean())) < 1e-3 and abs(float(task.y0.std()) - 1.0) < 1e-3)
-    check("an accepted task: X (P, d_kept), y0 (P,), finite, y0 standardized", ok,
-          f"P={P}, d_kept={task.diagnostics['d_kept']}; {log.summary()}")
+          and abs(float(task.y0.mean())) < 1e-3 and (floored or abs(float(task.y0.std()) - 1.0) < 1e-3))
+    check("an accepted task: X (P, d_kept), y0 (P,), finite, y0 standardized (std 1, or tabicl's 1e-6 std floor)",
+          ok, f"{'std floor hit (nearly constant y), ' if floored else ''}"
+              f"P={P}, d_kept={task.diagnostics['d_kept']}; {log.summary()}")
 
 
 def main():

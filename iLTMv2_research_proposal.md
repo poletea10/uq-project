@@ -296,7 +296,7 @@ In `graph_scm` (Qu et al., 2026), random vectors are sampled at root nodes and p
 Keep the feature generator's mechanism, and make the observed $X$ the **only** frozen-side input to a second, `graph_scm`-style target graph with its own private noise:
 
 $$
-X=\Phi_\theta(U_1)\ \ (\text{unmodified }\texttt{graph\_scm}), \qquad y=\Psi_\theta(X,U_2), \qquad U_1\perp U_2 .
+X=\Phi_\theta(U_1)\ \ (\texttt{graph\_scm}\text{ mechanism}), \qquad y=\Psi_\theta(X,U_2), \qquad U_1\perp U_2 .
 $$
 
 Now nothing has to be inferred from $X$: $p_\theta(y\mid X=x)$ is the law of $\Psi_\theta(x,U_2)$ with $U_2$ at its ordinary marginal. **Replication = hold $X$, redraw $U_2$, rerun the target branch.**
@@ -305,18 +305,17 @@ Now nothing has to be inferred from $X$: $p_\theta(y\mid X=x)$ is the law of $\P
  U1 ──► [ X-graph: graph_scm mechanism ] ──► X (observed columns)
                     │ feature-hosting nodes
                     ▼
-        [ X-input nodes: observed post-converter columns ‖ fresh hidden dims ] ─┐
-        [ private noise roots ] ────────────────────────────────────────────────┼─► [ Ψθ: graph_scm-style DAG ] ──► y
-                                  ▲                                             │
-                     U2 = hidden dims + private roots, redrawn per replicate ───┘
+        [ X-input nodes: node function of their parent value = observed post-converter columns ] ─┐
+                                                          (deterministic in X)                     ├─► [ Ψθ: graph_scm-style DAG ] ──► y
+        [ private noise roots ] ── U2: the only randomness, redrawn per replicate ─────────────────┘
 ```
 
 The target graph $\Psi_\theta$ copies `graph_scm` as closely as possible:
 
 - **Same DAG sampler, size range and node functions** as the $X$-graph (Cauchy DAG, 2–32 nodes, tabicl's node functions); tabicl's pruning keeps only the ancestors of $y$.
-- **$X$-input nodes are the $X$-graph's feature-hosting nodes.** A random subset of them (mirroring `subsample_feature_nodes`) is placed on random DAG positions whose incoming edges are cut. Each carries the **observed post-converter values** of the columns read from its host node, recomputed from the observed (outlier-clamped) columns, so $y$ depends on $U_1$ only through $X$. For the two categorical modes whose write-back is a latent value (`neighbor_id`, `softmax_id`), the observed category's center or embedding is used instead.
-- **Hidden dims.** Each $X$-input node also carries LogInt(1, 32) fresh random-point dimensions, mirroring `graph_scm`'s $d_i=\sum_j d_{ij}+\text{LogInt}(1,32)$, where the unread dimensions of a node are the noise. They belong to $U_2$.
-- **Private roots.** Every other parentless node draws random points, as `graph_scm`'s roots do ($U_2$).
+- **$X$-input nodes are the $X$-graph's feature-hosting nodes.** A random subset of them (mirroring `subsample_feature_nodes`) is placed on random DAG positions whose incoming edges are cut. The **observed post-converter values** of the columns read from the host node, recomputed from the observed (outlier-clamped) columns, are the node's **parent value**, never part of a root: the node is an ordinary non-root `graph_scm` node (tabicl's `RandomNodeFunction`: a random multi-input function of the block into LogInt(1, 32) latent dims, then standardization, importance weights, L2 normalization and node importance). It is a deterministic function of $X$, so $y$ depends on $U_1$ only through $X$. For the two categorical modes whose write-back is a latent value (`neighbor_id`, `softmax_id`), the observed category's center or embedding is used instead.
+- **Private roots.** Every other parentless node draws random points, as `graph_scm`'s roots do. They are $U_2$, the **only** randomness of the target graph: as in `graph_scm`, randomness enters only at roots (node noise off). Their noise is lowered, as calibrated by the difficulty-match gate below: outputs scaled by 0.1 and LogInt(1, 16) dims instead of LogInt(1, 32).
+- **No noise-ancestor requirement.** Only the graph check below constrains the target graph. When no private root is an ancestor of $y$, $y$ is an exact deterministic function of $X$ ($A=0$), the cut's counterpart of `graph_scm`'s near-deterministic tasks (about 60% of accepted stage-1 tasks). The design, its calibration and its gate results are in `experiment1_uq_heads/phase1_design.md`, Training §1.
 - $y$ is read from a random non-input node with the usual converter; $y$-warping follows `disallow_y_warping`.
 
 | | |
@@ -324,7 +323,7 @@ The target graph $\Psi_\theta$ copies `graph_scm` as closely as possible:
 | **Preserved** | $X$'s generating mechanism (same DAG sampler, node functions, converters, warping and cross-feature correlations). $y\mid x$ stays a non-Gaussian, heteroscedastic pushforward built from the same function classes |
 | **Not identical** | $X$'s distribution. (1) The $X$-graph is sampled with no $y$ node; in `graph_scm`, $y$ takes part in node assignment, pruning and the graph check, so the graphs and column placements that occur change. (2) The predictability filter runs on the cut $y$, so accepted $X$ is conditioned on a different acceptance event. (3) `ensure_iid=True`, whereas TabICLv2 was pretrained with `ensure_iid=False`. The difficulty-match gate below checks that the shift is small in practice |
 | **Given up** | (1) Latent confounding between $X$ and $y$. (2) Anti-causal features: in `graph_scm` features can be descendants of the $y$ node, while in the cut $X$ is never downstream of $y$. Both are measured by the T3 transfer test |
-| **Cost** | One extra pass of the target graph gives a replicate for every row at once (rows are tiled $R$ times), so $R$ replicates cost one pass per dataset |
+| **Cost** | One extra pass of the target graph over the query rows gives one replicate for every query at once, so $R$ replicates cost $R$ passes of a small graph per dataset. The passes are kept separate (not one pass over rows tiled $R$ times) so that every replicate runs through identical float32 kernels and the $U_2$-independent part of $y$ is bit-identical across replicates |
 
 **Implementation requirements.**
 
@@ -337,6 +336,7 @@ The target graph $\Psi_\theta$ copies `graph_scm` as closely as possible:
 **Task filtering.** TabICLv2 pretrains only on tasks that pass its filters (about 25 % of stage-1 regression tasks are rejected), so our tasks pass the same filters, applied to whole tasks before the split and the replicates (a rejected task is redrawn from scratch):
 
 - *Graph check*, adapted: applied to the **target graph**, resampled until at least one $X$ input is an ancestor of $y$ (the $X$-graph has no $y$ node).
+- Non-finite target-graph inputs reject the task: an $X$-graph latent can be NaN while its observed column is finite (e.g. a category index), and `graph_scm` would reject that dataset too, since the NaN reaches its $y$.
 - *Constant columns* removed; a task with no feature left is rejected.
 - *Predictability test* as in TabICLv2: an ExtraTrees model must beat the mean-label baseline out-of-bag (p < 0.05).
 - *Trivial-task test* off, so that the near-deterministic $A\approx0$ end is learned.
@@ -344,7 +344,7 @@ The target graph $\Psi_\theta$ copies `graph_scm` as closely as possible:
 
 The same filter is used for the validation bank and the T2 test bank, and the rejection rate is logged per stage; if it is much higher than TabICLv2's, tune the target graph's noise scale, not the filter.
 
-**Difficulty-match gate (prior level, before training).** Generate matched banks of cut tasks and unmodified `graph_scm` tasks (same row and feature counts, plain i.i.d. context–query split, no holes or extrapolation queries for this test only). On each task compute the frozen TabICLv2 CRPS on the queries and ExtraTrees held-out $R^2$ on the same split; compare the two distributions (medians, quantiles, two-sample tests) and the filter rejection rate per stage of both priors. If cut tasks are much easier or much harder, **tune the target graph** (hidden dims on $X$-input nodes, number or scale of private roots), **not the filters**, and rerun. The configuration and tolerance used are recorded in the Phase 1 documents (`experiment1_uq_heads/scripts/00f_difficulty_match.py`).
+**Difficulty-match gate (prior level, before training).** Generate matched banks of cut tasks and unmodified `graph_scm` tasks (same row and feature counts, plain i.i.d. context–query split, no holes or extrapolation queries for this test only). On each task compute the frozen TabICLv2 forecast on the queries (CRPS, and $R^2$ of its median) and ExtraTrees held-out $R^2$ on the same split. Per stage the gate requires: (1) a cut rejection rate in 5–30%; (2) a matching difficulty profile, i.e. ExtraTrees $R^2$ quantiles q10–q90 within 0.10 of `graph_scm`'s; (3) an in-domain check: in equal-count bins of ExtraTrees $R^2$, the median of $R^2(\text{TabICLv2})-R^2(\text{ExtraTrees})$ agrees between the priors (within 0.05 or overlapping bootstrap CIs; top, saturated bin not gated), which tells a harder slice of the prior (same advantage of the backbone) from a slice outside its domain (advantage lost). CRPS quantiles and two-sample tests are reported, not gated. If the gate fails, **tune the target graph's private-root noise** (scale and number of dims), **not the filters**, and rerun. The configuration and tolerance used are recorded in the Phase 1 documents (`experiment1_uq_heads/scripts/00f_difficulty_match.py`).
 
 **Known caveat.** The v2 prior's rejection filters discard near-unpredictable datasets, truncating the high-aleatoric tail the head is trained on. The empirical distribution of $\hat t_A$ is logged and reported.
 

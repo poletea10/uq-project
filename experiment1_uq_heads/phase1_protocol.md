@@ -41,7 +41,7 @@ experiment1_uq_heads/
 │   │   ├── _cut_graph_scm.py  # CutGraphSCM: X-graph (graph_scm mechanism) + graph_scm-style target graph Ψ(X_obs, U2)
 │   │   ├── _cached_graph.py   # graph_lib root law / node / graph functions with task-level draws cached
 │   │   ├── _postprocess.py    # fit/apply versions of outlier_removing / standard_scaling; the y transform g
-│   │   ├── _split.py          # extrapolation tail, kNN hole (FAISS), iid split, duplicates — X only
+│   │   ├── _split.py          # extrapolation tail, kNN hole (distances to one centre), iid split, duplicates — X only
 │   │   ├── _filter.py         # wraps check_x_y_ancestors_overlap (on the y-graph), delete_unique_features, should_filter
 │   │   ├── _dataset.py        # task RNG, task shapes (pipeline steps 1–3), sample_task; CutGraphPrior: infinite
 │   │   │                      #   iterator → UQBatch (mirrors tabicl GraphPrior.get_batch; step 4)
@@ -141,7 +141,7 @@ Implements design Training §1 (pipeline steps 1–7, 10) and §1.4.
 
 Log the rate per stage and the empirical distribution of $\hat t_A$, including its zero-mass fraction (proposal §4.3, "Known caveat").
 
-**Difficulty-match gate.** `00f_difficulty_match.py` (GPU) compares matched cut and unmodified `graph_scm` tasks (stages 1–2; stage 3 rejection rate only) on frozen TabICLv2 CRPS and ExtraTrees held-out $R^2$, and logs both priors' rejection rates, the y-ancestor subgraph sizes and the $\hat t_A$ distribution. It also applies the 5%–30% rejection gate. On a failure, tune the target graph (`--hidden-dims`, `--hidden-scale`, `--private-root-scale`), never the filters, and rerun. Record the final configuration and tolerance in design §1.4.
+**Difficulty-match gate.** `00f_difficulty_match.py` (GPU) compares matched cut and unmodified `graph_scm` tasks (stages 1–2; stage 3 rejection rate only) on ExtraTrees held-out $R^2$ (difficulty profile) and on TabICLv2's advantage over ExtraTrees at matched difficulty (in-domain check), with the 5%–30% rejection gate; the pass rule is in design §1.4. It also logs both priors' rejection rates, TabICLv2 CRPS, the y-ancestor subgraph sizes and the $\hat t_A$ distribution. On a failure, tune the target graph's private-root noise (`--private-root-scale`, `--private-root-dims`), never the filters, and rerun. The calibrated defaults and their stage-1 results are in design Training §1, "The observed-cut prior". Record the final configuration and tolerance in design §1.4.
 
 ### Step 3 — Split
 
@@ -219,11 +219,11 @@ Project convention (root `CLAUDE.md`): no pytest. Each subsection below is one p
 
 ## 5. Split figures (after step 3)
 
-`03_plot_split_tasks.py` draws five figures, one per random task, to check by eye that the cut-graph tasks are heteroscedastic and that the split does what it should. The layout follows TabICLv2's Figure F.11: a 2-D scatter with the third quantity encoded by colour.
+`03_plot_split_tasks.py` draws ten figures, one per random task, to check by eye that the cut-graph tasks are heteroscedastic and that the split does what it should. The layout follows TabICLv2's Figure F.11: a 2-D scatter with the third quantity encoded by colour.
 
 **Tasks.**
 
-- Five tasks from the observed-cut prior with exactly **2 features** and the stage-1 shape (N = 1,024), from a fixed figure seed disjoint from all others.
+- Ten tasks from the observed-cut prior with exactly **2 features** and the stage-1 shape (N = 1,024), from a fixed figure seed disjoint from all others. Ten rather than five because about 60% of tasks are exactly deterministic (no private root reaches y); there is **no selection on noise**, so the figures show the real mix, and each title says whether the task is noisy or deterministic.
 - Keep only tasks whose two features each have at least 10 unique values, as TabICLv2 does for its prior plots (Figure F.1 caption). Otherwise categorical columns stack points on top of each other.
 - The full pipeline runs: pool, $g$, filter, split, duplicates.
 - For the figure only, **every pool row** gets $R_{\text{fig}} = 128$ replicates, so the aleatoric entropy can be shown everywhere, not just at queries.
@@ -233,7 +233,7 @@ Project convention (root `CLAUDE.md`): no pytest. Each subsection below is one p
 | Panel | Points | Colour |
 |---|---|---|
 | 1 — Target | All $P$ pool rows | $g(y^{(0)})$, sequential colormap with a colourbar |
-| 2 — Aleatoric spread | All $P$ pool rows | $\hat t_A$ from the 128 replicates, min–max scaled per task to [0, 1] (0 = lowest, 1 = highest spread in that task) |
+| 2 — Aleatoric spread | All $P$ pool rows | $\hat t_A$ from the 128 replicates, min–max scaled per task to [0, 1] (0 = lowest, 1 = highest spread in that task); a deterministic task ($\hat t_A\equiv0$) shows a flat panel saying so |
 | 3 — Split | All $P$ pool rows | **blue**: context; **red**: queries; **purple**: duplicate queries; **light grey**: discarded hole/tail rows |
 
 Panel 3 details:
@@ -241,14 +241,16 @@ Panel 3 details:
 - **Draw order:** grey, blue, red, purple, so duplicates stay visible on top of the context point they copy.
 - **Marker shape per query type:** circle for iid, square for hole, triangle for extrapolation. This makes the carved regions readable without extra colours.
 - **Discarded rows are shown in grey** because they belong to neither group. Leaving them out would make the hole and tail look like empty space.
+- **Hole centre:** the pool row the kNN hole is built around, drawn as a large star.
+- **Extrapolation direction:** the random direction $u$, drawn as an arrow from the pool's centroid, and the tail boundary, a dashed line perpendicular to $u$ at the smallest tail score; the tail lies beyond it on the arrow's side. With $d = 2$ both are exact, not projections.
 
 **What to look for:**
 
-- **Panel 2 is not uniform** in most tasks, i.e. the noise is heteroscedastic. A task whose panel 2 is flat is homoscedastic, which is allowed but should not be the norm. With R = 128 the scaled values carry about 6% noise, so small speckle is expected.
+- **Panel 2 is not uniform** in most noisy tasks, i.e. the noise is heteroscedastic. A task whose panel 2 is flat is homoscedastic, which is allowed but should not be the norm. With R = 128 the scaled values carry about 6% noise, so small speckle is expected.
 - **Panel 2 does not track the split.** $A$ is a property of $x$ in the task, fixed before the split, so the hole and tail are not systematically high-$A$ regions.
-- **Panel 3:** the hole is one compact region with no blue points. The tail is the region beyond a straight line (the random direction $u$). Purple points sit on blue points. Red iid points are scattered uniformly among the blue.
+- **Panel 3:** the hole is one compact region around the star with no blue points. The tail is the region beyond the dashed line, in the arrow's direction. Purple points sit on blue points. Red iid points are scattered uniformly among the blue.
 
-Save to `audits/split_figures/task{1..5}.png`. These figures also go into the thesis as the illustration of the observed-cut prior and the query mixture.
+Save to `audits/split_figures/task{01..10}.png`. These figures also go into the thesis as the illustration of the observed-cut prior and the query mixture.
 
 ---
 

@@ -24,12 +24,16 @@ Train two scalar heads (Â aleatoric, Ê epistemic) on top of the frozen TabICLv
 
 Step 1 (entropy and targets): done, `00a_test_entropy` passes.
 
-Step 2 (observed-cut prior and filter): `src/iltm2/prior/` written (`_cut_graph_scm.py` the cut itself, `_cached_graph.py` cached graph_lib pieces, `_postprocess.py` fit/apply post-processing, `_filter.py`, `_dataset.py` task RNG + shapes + `sample_task`), with the target graph as a `graph_scm`-style DAG whose X-input nodes are the X-graph's feature-hosting nodes (proposal §4.3). Gates: `scripts/00b_test_cut_prior.sh` (unit tests, CPU) and `scripts/00f_difficulty_match.sh` (prior-level gate, GPU: cut vs `graph_scm` CRPS / ExtraTrees R², rejection rates). After the difficulty gate passes, record the final target-graph config and tolerance in design §1.4.
+Step 2 (observed-cut prior and filter): done; prior configuration fixed. Code in `src/iltm2/prior/` (`_cut_graph_scm.py` the cut itself, `_cached_graph.py` cached graph_lib pieces, `_postprocess.py` fit/apply post-processing, `_filter.py`, `_dataset.py` task RNG + shapes + `sample_task`). The design, what changed from `graph_scm` and why, and the difficulty-match results are in design Training §1, "The observed-cut prior". Defaults: no noise-ancestor check, `private_root_scale` 0.1, `private_root_dims_range` (1, 16). Gates: `scripts/00b_test_cut_prior.sh` (unit tests, CPU) and `scripts/00f_difficulty_match.sh` (prior-level gate; stage 1 accepted with the q25 deviation documented in the design). To do: add stage-2/3 results of job 45910541 to the design once it finishes. Next: step 3 (`_split.py`).
 
 Gotchas found while building it:
 - In v2's `NumericalConverter` (`use_corrected_num_converters=False`) the returned column is a view of the node slice that is then overwritten with the write-back, so the observed numerical column *is* the warped write-back.
 - Nodes pruned by tabicl are never fitted (no `converters_`); only feature-hosting nodes are guaranteed fitted.
 - Bit-identical tasks across processes need the same torch intra-op thread count (1 in DataLoader workers).
+- An X-graph latent can be NaN while its observed column is finite (e.g. a category index from argmin): its center then reaches the target graph. Non-finite target-graph inputs reject the task (`non_finite_x`). Never guard with `torch.equal` on tensors that may hold NaN (NaN != NaN); use the bitwise `_same_bits`.
+- Replicates must be R separate passes over the same rows, never one pass over tiled rows: float32 round-off depends on a row's position in the batch, and tree splits / argmins amplify it into spurious replicate spread (up to 0.2 std(y) on deterministic tasks).
+- A non-finite replicate is only seen after acceptance: `RejectionLog.revoke("non_finite_replicate", ...)` turns the task into a rejection, and the caller draws a new one (done in `00f`; step 4's dataset must do the same).
+- About 60% of accepted tasks are exactly deterministic (no private root reaches y, t_A ≡ 0); the `00b` tests that need noise pick a noisy task explicitly (`noisy_task`).
 
 ## Waiting on
 
