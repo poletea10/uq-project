@@ -416,7 +416,7 @@ The heads read $h_*$ by default, but pinball pretraining only asks $h_*$ to enco
 | Arm | What the heads read | Backbone |
 |---|---|---|
 | **A1** (default) | $h_*$ through the MLP trunks of §4.4. Tests whether the split is present in $h_*$ | Fully frozen; PPD identical to TabICLv2 |
-| **A2** | A learned softmax-weighted mix of per-layer, separately normalised residual-stream vectors of the query row (e.g. blocks 4, 8, 12, or all 12). Addresses information that later layers merged away; the learned weights show *which depth* holds the decomposition information | Frozen; PPD unchanged |
+| **A2** | A learned softmax-weighted mix of per-layer, separately normalised residual-stream vectors of the query row (e.g. blocks 4, 8, 12, or all 12). Addresses information that later layers merged away. The learned weights are a training diagnostic, not a localisation: each layer's trainable LN gain can offset its weight, and the residual stream carries information forward to later blocks, so the weights do not identify which block holds the decomposition information | Frozen; PPD unchanged |
 | **B** | A trainable copy of the last $k\in\{1,2\}$ ICL-transformer blocks and final LayerNorm, initialised from the pretrained weights, re-attending to the context under the UQ loss and feeding only the heads | Originals stay frozen and keep feeding the decoder, so the PPD is bit-identical and B starts exactly where A1 ends. Unlike Bergna et al., who unfreeze shared layers and change the PPD. Costs about $k/12$ extra compute |
 
 **Comparing rungs needs no ground truth.** On held-out cut-graph tasks, $\mathbb E[(\hat A-\hat t_A)^2]=\mathbb E[(\hat A-A)^2]+\text{target-noise variance}$, and the noise term is identical across arms, so a lower validation loss *is* a lower true error. T2 grading then confirms it.
@@ -437,17 +437,17 @@ Following TabICLv2's meta-training logic: one training example is a whole synthe
 
 Hole and tail sizes are drawn per task (log-uniform, up to $0.2N$), so queries cover a range of divergences. In addition, 5 % of query slots get their $x$ overwritten by a context row's $x$ (a fresh $y$ is drawn), teaching the low-divergence end (cf. DEUP's seen-bit). Every split decision depends only on $X$, so the posterior over the $y$-law given the manipulated context is unchanged and the targets keep their meaning; selecting on $y$ would break this and is never done. The mixture only decides where head capacity is spent, not the minimiser.
 
-**Curriculum** (TabICLv2's 500K : 40K : 10K stages, scaled by 1/10), batch of 64 tasks (gradient accumulation in stages 2–3), AdamW with a cosine schedule restarted per stage:
+**Curriculum** (TabICLv2's 500K : 40K : 10K stages, scaled by 1/10), batch of 32 tasks (half of TabICLv2's 64, to halve the wall time per step; gradient accumulation in stages 2–3), AdamW with a cosine schedule restarted per stage:
 
-| Stage | Steps | Rows $N$ per task | Context fraction | Head LR |
-|---|---|---|---|---|
-| 1 | 50,000 | 1,024 | 30–90 % | `lr` |
-| 2 | 4,000 | 400–10,240 | ≈80 % | `lr`/8 |
-| 3 | 1,000 | 400–60,000 | ≈80 % | `lr`/40 |
+| Stage | Steps | Rows $N$ per task | Context fraction | Head LR | Fork LR (B) |
+|---|---|---|---|---|---|
+| 1 | 50,000 | 1,024 | 30–90 % | `lr` | `fork_lr` |
+| 2 | 4,000 | 400–10,240 | ≈80 % | `lr`/8 | `fork_lr`/8 |
+| 3 | 1,000 | 400–60,000 | ≈80 % | `lr`/40 | `fork_lr`/40 |
 
-**Validation.** A fixed bank of 2,000 tasks (50 / 30 / 20 % small / medium / large $N$, so large-$n$ bins are not empty), same pipeline and query mixture, $R_{\text{val}}=128$ replicates, seeds disjoint from every test bank. The unweighted MSE of $\hat A$ and of $\hat E_{\text{dir}}$ is logged separately, per query type and per $n$ bin, every 2,500 steps and at each stage end. Three checkpoints per run: latest, best-$\hat A$ and best-$\hat E_{\text{dir}}$ (checkpoint selection, not early stopping). In B the heads share the fork, so both heads are logged at both checkpoints to expose trade-offs.
+**Validation.** A fixed bank of 2,000 tasks (50 / 30 / 20 % small / medium / large $N$, so large-$n$ bins are not empty), same pipeline and query mixture, $R_{\text{val}}=128$ replicates, seeds disjoint from every test bank. The unweighted MSE of $\hat A$ and of $\hat E_{\text{dir}}$ is logged separately, per query type and per $n$ bin, every 5,000 steps and at each stage end (plus a 64-task mini-bank every 250 steps). Three checkpoints per run: latest, best-$\hat A$ and best-$\hat E_{\text{dir}}$ (checkpoint selection, not early stopping). In B the heads share the fork, so both heads are logged at both checkpoints to expose trade-offs.
 
-**Sweeps and selection.** Head LR $\in\{10^{-4},3\cdot10^{-4},10^{-3}\}$ for A1 and A2; for B also fork LR $\in\{3\cdot10^{-6},10^{-5},3\cdot10^{-5}\}$ with $k=2$. All arms use paired seeds $\{0,1,2\}$ (the seed fixes both task stream and head initialisation).
+**Sweeps and selection.** Head LR $\in\{10^{-4},3\cdot10^{-4},10^{-3}\}$ for A1 and A2; for B also fork LR $\in\{3\cdot10^{-6},10^{-5},3\cdot10^{-5}\}$ with $k=2$. Both are stage-1 values; stages 2–3 follow the fixed ratios of the table above. All arms use paired seeds $\{0,1,2\}$ (the seed fixes both task stream and head initialisation).
 
 1. Within A1/A2, configurations are chosen **per head** (the heads are independent); within B, as a whole configuration.
 2. Arms are compared on a mixed score, the sum of each head's MSE relative to the default A1 configuration (below 2 means better than default A1 overall); it is used only to choose the arm.

@@ -136,7 +136,7 @@ R ─► TFicl blocks 1 … 12 (frozen) ─► LN (frozen) ─► h [A1: read fr
 
 - **Procedure.** Take the query row's residual-stream vectors after several blocks (e.g. $r_4,r_8,r_{12}$, or all 12). Give each its own trainable LN, combine them as $\sum_\ell\alpha_\ell\,\mathrm{LN}_\ell(r_\ell)$ with $\alpha=\mathrm{softmax}(s)$ (learned scalars: positive, summing to 1), and feed the result to the same trunks. The backbone stays frozen and the PPD unchanged.
 - **Why it addresses the caveat.** Only the last layer was forced to serve the pinball objective. Intermediate layers may still hold information that later layers merged away because the PPD did not need it, e.g. how strongly nearby context targets disagree before being collapsed into one predictive.
-- **Bonus.** The learned $\alpha_\ell$ show *which depth* the decomposition information lives at.
+- **What the weights do not show.** The learned $\alpha_\ell$ do **not** say which block holds the decomposition information, for two reasons. (1) The trunk sees $\alpha_\ell$ times $\mathrm{LN}_\ell$'s learned gains, so a small $\alpha_\ell$ can be compensated by large gains: the weights are not identifiable on their own. (2) The residual stream is cumulative ($r_\ell=r_{\ell-1}+$ block $\ell$'s update), so information present at block $\ell$ is usually still present at later blocks, and the mix can draw it from any of them. The $\alpha_\ell$ are logged only as a training diagnostic (e.g. weight piling on $r_{12}$ means A2 is behaving like A1). A2's result is its validation loss against A1's.
 - **Cost.** A few extra 512-d vectors per query.
 
 #### Arm B — trainable fork of the last $k$ blocks
@@ -215,6 +215,8 @@ Two implementation details keep the replicates exact: replicates are drawn as **
 | $R^2$ ceiling q10 / q50; share ≥ 0.9 | 0.35 / 1.00; 77.7% | – |
 
 The design passes the rejection-rate and in-domain checks. The difficulty profile is within 0.10 at every quantile except q25 (−0.156): cut tasks are slightly harder in the lower-middle of the distribution, with matching medians and upper tail. This deviation was **accepted**: TabICLv2's advantage over ExtraTrees at matched difficulty is the same on both priors, so the cut stays inside the backbone's domain, and the large exactly-deterministic share is acceptable for the heads (it is the $A=0$ end they must learn). The zero-mass fraction above was measured before the separate-pass fix; regenerating the same tasks after the fix gives 63% of tasks with $\hat t_A\equiv0$ and no deterministic task with $\hat t_A>0$. Stage 2 and stage 3 results are added when that run finishes (preliminary stage-2 cut rejection rate: 34.7%).
+
+**Rejection rate of the training stream (accepted).** In the full training stream (the pipeline above plus splits and replicates, measured by the step-4 throughput benchmark), the stage-1 rejection rate sits somewhat above the 5–30% bound. This was **accepted** as a documented deviation, not tuned away: the excess is small and was already seen around the calibration above; the rejections come from tabicl's own filters, which define the backbone's prior and are never changed; and its only cost is CPU time per accepted task, already included in the step-4 timings.
 
 ### Fixed sizes
 
@@ -317,19 +319,19 @@ TabICLv2 pretrains only on tasks that pass its filters (TabICLv2 §3 "Data filte
 
 ## 2. Curriculum, batch, and optimization
 
-| Stage | Steps (default) | Rows N per task | Context fraction | Head max LR |
-|---|---|---|---|---|
-| 1 | 50,000 | 1,024 | 30–90% | `lr` |
-| 2 | 4,000 | 400–10,240 (log-uniform) | ≈80% | `lr` / 8 |
-| 3 | 1,000 | 400–60,000 (log-uniform) | ≈80% | `lr` / 40 |
+| Stage | Steps (default) | Rows N per task | Context fraction | Head max LR | Fork max LR (B) |
+|---|---|---|---|---|---|
+| 1 | 50,000 | 1,024 | 30–90% | `lr` | `fork_lr` |
+| 2 | 4,000 | 400–10,240 (log-uniform) | ≈80% | `lr` / 8 | `fork_lr` / 8 |
+| 3 | 1,000 | 400–60,000 (log-uniform) | ≈80% | `lr` / 40 | `fork_lr` / 40 |
 
 - **Step budget.** TabICLv2's 500K : 40K : 10K proportions, scaled by 1/10. The steps per stage are inputs.
-- **Learning rate.** `lr` is the swept value (§4). Stages 2–3 scale it down by TabICLv2's own ratios (8e-4 → 1e-4 → 2e-5). Use a cosine schedule **restarted per stage**, as in TabICLv2's scripts: each stage is a separate launch that loads only the previous stage's weights (`--only_load_model True`, so optimizer and scheduler state reset), then warms up for 1% of its steps to its max LR and decays with a single cosine cycle to 1e-7 (`--scheduler cosine_with_restarts --cosine_num_cycles 1 --warmup_proportion 0.01 --cosine_lr_end 1e-7`, `scripts/train_v2_reg_stage{2,3}.sh`).
+- **Learning rate.** `lr` (head) and, in B, `fork_lr` are the swept values (§4), both stage-1 values. Stages 2–3 scale both down by TabICLv2's own ratios (8e-4 → 1e-4 → 2e-5, i.e. /8 and /40), as TabICLv2 scaled its whole model. The ratios are fixed, not swept per stage: a configuration is one stage-1 value per LR, and the same ratios set its stages 2–3. Use a cosine schedule **restarted per stage**, as in TabICLv2's scripts: each stage is a separate launch that loads only the previous stage's weights (`--only_load_model True`, so optimizer and scheduler state reset), then warms up for 1% of its steps to its max LR and decays with a single cosine cycle to 1e-7 (`--scheduler cosine_with_restarts --cosine_num_cycles 1 --warmup_proportion 0.01 --cosine_lr_end 1e-7`, `scripts/train_v2_reg_stage{2,3}.sh`).
 - **Optimizer.** AdamW for the heads (all arms) and the fork (B), with weight decay $10^{-5}$, gradient-norm clipping at 5.0 and $\beta=(0.9,0.999)$. These follow DecoupledPFN's defaults (Bergna et al., App. B.3), the closest precedent.
 - **Muon is deliberately not inherited from TabICLv2's scripts** (`--muon True` in `scripts/train_v2_reg_stage*.sh`; pass `--muon False` if their flags are reused). Muon helped TabICLv2's pretraining of the full model from scratch (TabICLv2 §4.1, ablation Fig. C.1). It is a pretraining tool, not one for fine-tuning or for training small decoders like the A1/A2 trunks.
 
 > **Conditional ablation: Muon for the fork.** The fork's blocks are copies of weights that were pretrained with Muon. If arm B wins the ladder comparison (§4, procedure step 2–3), run one extra configuration of B's winner: Muon on the fork's 2-D matrices only, AdamW for the heads and all 1-D parameters, same seeds. Its LR grid must be set on Muon's scale. Not run otherwise.
-- **Batch.** 64 tasks per step, as in TabICLv2. The backbone runs frozen under `torch.no_grad()`, so no backbone activations are stored. Stage 1 (1,024 rows) fits comfortably on mid-range GPUs. In stages 2–3 (up to 60K rows), reach 64 by **gradient accumulation over micro-batches** (TabICLv2's own mechanism, `micro_batch_size` in `_run.py`).
+- **Batch.** 32 tasks per step, half of TabICLv2's 64, with the step budget unchanged. This halves the wall time per step: stage 1 is bound by the CPU workers that generate the tasks, not by the GPU (step-4 throughput gate, protocol §3), and stages 2–3 by the backbone forward, both proportional to the tasks per step. The cost is half as many training tasks per run and noisier gradients per step. Micro-batch groups keep TabICLv2's sizes (4 tasks in stage 1, so 8 groups per step; 1 task in stages 2–3, so 32). The backbone runs frozen under `torch.no_grad()`, so no backbone activations are stored. Stage 1 (1,024 rows) fits comfortably on mid-range GPUs. In stages 2–3 (up to 60K rows), reach 32 by **gradient accumulation over micro-batches** (TabICLv2's own mechanism, `micro_batch_size` in `_run.py`).
 - **Arm B.** It backpropagates through the k = 2 forked blocks, so it needs gradient checkpointing above about 20K rows (TabICLv2 App. B.2 does the same).
 - **Feature counts** follow TabICLv2's prior settings (random per task, up to 100 features).
 
@@ -351,9 +353,13 @@ TabICLv2 pretrains only on tasks that pass its filters (TabICLv2 §3 "Data filte
 
   ScoringBench subsamples every dataset to at most 3,000 rows (2,400 train + 600 test; ScoringBench App. C.2), and about 70% of TabArena's 51 datasets have fewer than 10K rows (15 have 10K–100K; TabPFN-3 §3.1.1).
 
+> **What the bank showed** (built bank, `VAL_BANK_SEED`; checks of protocol §3 step 6, all passed).
+> - **Extrapolation queries carry more epistemic uncertainty than hole queries.** The ordering duplicate < iid < hole, extrapolation held as expected, but hole and extrapolation were not similar: mean $\hat t_E$ is 0.036 (iid), 0.064 (hole) and 0.088 (extrapolation), about 27% higher for extrapolation, and consistently so in every N bin (task-level bootstrap 95% CIs of extrapolation − hole exclude 0 in the small, medium and large bins). Predicting beyond the support of the context is harder than filling a gap inside it. Rules of thumb that expect hole ≈ extrapolation (protocol §8.2) should be read with this in mind.
+> - **The PPD's own uncertainty tracks the aleatoric target, not the epistemic one** (a result for the paper). Test: the **e(q) proxy** reference line (protocol §8.1) is the best predictor of a target that sees only the backbone's CRPS entropy $e(q_\theta)$: 50 equal-count bins of $e(q_\theta)$, each predicting its bin's mean target, fitted on half of the bank's tasks and scored on the other half (cross-fitted on even/odd tasks, so no query is scored by bins fitted on its own task). Its **skill** is $1-\text{xMSE}_{\text{proxy}}/\text{xMSE}_{\text{const}}$, the share of the target's variance (beyond the constant baseline) that $e(q_\theta)$ explains, with replicate noise removed by the xMSE. On the pooled bank: **skill 0.61 for $\hat t_A$** (xMSE 0.0132 vs 0.0342 for the constant) and **skill 0.12 for $\hat t_E$** (xMSE 0.0321 vs 0.0364). The noise floors (3.3e-4 for $\hat t_A$, 4.1e-5 for $\hat t_E$) are tiny next to these, so the gap is not target noise. So the backbone's total predictive spread is largely a measure of aleatoric uncertainty and says little about how far its forecast is from the task's true law: the epistemic part must be extracted by a dedicated head, which is the thesis of this project (proposal §1.1). For the paper: report both skills as the baseline the Ê head must beat, and as direct evidence that PPD spread is not an epistemic signal.
+
 ### What is logged every N steps
 
-- **Default cadence:** every 2,500 steps in stage 1, and at the end of each stage.
+- **Default cadence:** every 5,000 steps in stage 1 (10 evaluations, the last at the stage end), and at the end of stages 2 and 3. A full bank evaluation costs about half an hour of GPU time (dominated by the 400 large tasks; A2's per-layer taps and B's fork cannot be cached), so this keeps validation to roughly 5 h per run. The best-$\hat A$ / best-$\hat E_{\text{dir}}$ checkpoints are therefore chosen at 5,000-step resolution in stage 1. A 64-task mini-bank is evaluated every 250 steps for a finer, cheap curve (protocol §7.4); it is not used for checkpoint selection.
 - **Metrics:** unweighted MSE of $\hat A$ against $\hat t_A$, and of $\hat E_{\text{dir}}$ against $\hat t_E$, logged **separately**. What happens in the low-uncertainty regime is read from the per-type and per-bin breakdowns.
 - **Breakdowns:** per query type (i.i.d., hole, extrapolation, duplicate), for the total mix, and per n bin (≤512, 512–1K, 1K–4K, 4K–16K, 16K–60K).
 - **Reading the curves.** The target-noise term of the MSE is identical for every checkpoint and run, so differences between runs are differences in true error. Because the bank is fixed, every comparison is paired (same tasks), which removes task-to-task noise.
@@ -453,14 +459,15 @@ Each A job varies both initialization and data, exactly like B's seeds. A1 and A
 | Extrapolation tail ρ | random per task, ≥ query budget |
 | R (train) / R_val | 16 / 128 |
 | Steps per stage | 50K / 4K / 1K (TabICLv2 proportions ÷ 10) |
-| Batch | 64 tasks, with micro-batch accumulation in stages 2–3 |
+| Batch | 32 tasks (half of TabICLv2's 64), with micro-batch accumulation in stages 2–3 |
 | Head LR (stage 1); stages 2/3 | swept {1e-4, 3e-4, 1e-3}; ×1/8, ×1/40 |
-| Fork LR (B), k | swept {3e-6, 1e-5, 3e-5}; k = 2 |
+| Fork LR (B, stage 1); stages 2/3 | swept {3e-6, 1e-5, 3e-5}; ×1/8, ×1/40 |
+| Fork depth k (B) | 2 |
 | Optimizer | AdamW (heads and fork), weight decay 1e-5, β = (0.9, 0.999); Muon only as a conditional fork ablation if B wins |
 | Gradient clipping | 5.0 (per head pair in A jobs; fork + heads jointly in B) |
 | Forward route | one raw training-mode forward (`_icl_predictions`), no `TabICLRegressor` ensemble, everywhere: training, validation, Phase 0 |
 | Loss weight exponent | p = 0 fixed; p = 2 only as a fallback ablation |
-| Validation | 2,000 tasks (50 / 30 / 20 by N), unweighted MSE per head, every 2,500 steps + end of each stage |
+| Validation | 2,000 tasks (50 / 30 / 20 by N), unweighted MSE per head, every 5,000 steps + end of each stage; mini-bank (64 small tasks) every 250 steps |
 | Stopping | none; keep latest + best-$\hat A$ + best-$\hat E_{\text{dir}}$ checkpoints per run |
 | Selection | per head within an arm (B: whole configuration) → best arm by mixed score vs default A1 → best seed |
 | Task filtering | graph check (on the y-graph), constant columns, ExtraTrees predictability test (p < 0.05); trivial-task test off |

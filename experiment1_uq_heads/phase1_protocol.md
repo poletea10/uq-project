@@ -45,6 +45,7 @@ experiment1_uq_heads/
 │   │   ├── _filter.py         # wraps check_x_y_ancestors_overlap (on the y-graph), delete_unique_features, should_filter
 │   │   ├── _dataset.py        # task RNG, task shapes (pipeline steps 1–3), sample_task; CutGraphPrior: infinite
 │   │   │                      #   iterator → UQBatch (mirrors tabicl GraphPrior.get_batch; step 4)
+│   │   ├── _graph_scm_ref.py  # unmodified graph_scm tasks (the reference prior of 00f and the bank checks)
 │   │   └── _bank.py           # build / save / load the validation bank (sharded, like tabicl's _genload.py)
 │   ├── model/
 │   │   ├── _entropy.py        # quantiles → CDF (one convention), e_crps(q), crps(q, y), in torch
@@ -67,6 +68,7 @@ experiment1_uq_heads/
     ├── 00e_test_heads.py      # unit tests §4.5
     ├── 00f_difficulty_match.py # prior-level gate of step 2: cut vs graph_scm difficulty (§3, step 2; GPU)
     ├── 01_make_val_bank.py    # bank + mini-bank + reference lines (§3, step 6)
+    ├── 01b_check_val_bank.py  # the bank checks of §3 step 6 (+ integrity, reproducibility), after 01
     ├── 02_benchmark_prior.py  # throughput per stage (§3, step 4)
     ├── 03_plot_split_tasks.py # split figures (§5)
     ├── train_A.sh             # <stage> <seed> <wandb_key>
@@ -115,9 +117,9 @@ Each step has a gate that must pass before the next one starts.
 | # | Build | Gate |
 |---|---|---|
 | 1 | `_entropy.py`, `_targets.py` | Unit tests of §4.1 pass |
-| 2 | `_cut_graph_scm.py`, `_cached_graph.py`, `_postprocess.py`, `_filter.py`, `_dataset.py` (task shapes) | Replicate tests of §4.2 pass (`00b`); rejection rate between 5% and 30%; difficulty-match gate passes (`00f_difficulty_match`) |
+| 2 | `_cut_graph_scm.py`, `_cached_graph.py`, `_postprocess.py`, `_filter.py`, `_dataset.py` (task shapes) | Replicate tests of §4.2 pass (`00b`); rejection rate between 5% and 30% (stage 1's training stream slightly above it: accepted, design Training §1); difficulty-match gate passes (`00f_difficulty_match`) |
 | 3 | `_split.py` | Split tests of §4.3 pass; split figures of §5 look right |
-| 4 | `_dataset.py` + DataLoader, `02_benchmark_prior.py` | Throughput: prior time well below step time in every stage |
+| 4 | `_dataset.py` + DataLoader, `02_benchmark_prior.py` | Throughput: prior time ≤ 0.8 × step time in every stage |
 | 5 | `_backbone.py` | Backbone tests of §4.4 pass |
 | 6 | `01_make_val_bank.py` | Bank checks below pass; reference lines stored in the manifest |
 | 7 | `_heads.py`, `_loss.py`, `_metrics.py`, `_validate.py` | Head tests of §4.5 pass |
@@ -149,7 +151,11 @@ Implements design Training §1.1–1.2. Once `_split.py` passes its tests, run `
 
 ### Step 4 — Dataset and throughput
 
-`02_benchmark_prior.py` measures tasks per second for each stage's shapes with the planned number of DataLoader workers. A step consumes 64 tasks, so the target is a prior time per step well below the step's train time. If it is not, raise `n_jobs` first, then lower the region bounds in stage 3 (design §1.1, "Cost of the enlarged pool").
+`02_benchmark_prior.py` measures tasks per second for each stage's shapes with the planned number of DataLoader workers. A step consumes 32 tasks (`BATCH_SIZE`, design Training §2), so the target is a prior time per step of at most 0.8 × the step's train time (the backbone forward, a lower bound on an A-job step). The workers build tasks while the GPU trains, so a step costs the slower of the two; the remaining 20% absorbs step-to-step variation, with at least 2 steps of items in flight. If it is not met, raise `n_jobs` first, then lower the region bounds in stage 3 (design §1.1, "Cost of the enlarged pool").
+
+**Gate outcome (accepted).** Stages 2–3 pass. Stage 1 does not: it is CPU-bound, since even perfect parallelism over the job's 34 CPU threads (about 17 physical cores) builds a step's tasks more slowly than the backbone consumes them. This was accepted with the core allocation unchanged: stage 1 runs at the prior's pace, and the batch was halved to 32 tasks (design Training §2) to shorten every stage. No offline pre-generation of the stream.
+
+**Loader.** Task cost is heavy-tailed in N (in stage 3, from under a second to tens of seconds per task). An in-order DataLoader lets one slow task block the delivery of all later ones and idles the other workers. `make_dataloader` therefore delivers items out of order (`in_order=False`, new work only to workers with free capacity), builds each step's groups largest N first, and keeps `prefetch_factor` 4; `iterate_steps` is a per-step reorder buffer that yields each step's groups only when all are in, in group order. Every item is a pure function of (seed, stage, step, group), so the trainer's batches are bit-identical to an in-order loader's; the benchmark checks this.
 
 ### Step 5 — Backbone wrapper
 
@@ -336,16 +342,16 @@ $\mathbb E[(\hat A-A_\tau)^2]$, with the replicate-noise term gone. **xMSE is th
 - loss (weighted), learning rate, gradient norm per head;
 - `prior_time`, `train_time`, rejection rate;
 - means of $\hat t_A$, $\hat t_E$, $\hat A$, $\hat E_{\text{dir}}$, $e(q_\theta)$, and the fraction of $\hat t_E<0$;
-- A2: the softmax weights $\alpha_\ell$ per layer;
+- A2: the softmax weights $\alpha_\ell$ per layer (a diagnostic only, not a localisation of the information; design Architecture §4, "Arm A2");
 - B: $\lVert\theta_{\text{fork}}-\theta_{\text{fork},0}\rVert$.
 
 ### 7.4 Mini-bank (every 250 steps)
 
 64 small tasks (N = 1,024) from the validation bank, with their R_val = 128 targets. They are the same tasks at every evaluation, so the comparison between checkpoints is paired and the curve is far smoother than the training one. Logged: `mini/mse_*` and `mini/xmse_*` per head. Cost: one backbone forward on 64 small tasks (cached for A jobs) plus the heads.
 
-### 7.5 Validation (every 2,500 steps in stage 1, and at the end of each stage)
+### 7.5 Validation (every 5,000 steps in stage 1, and at the end of each stage)
 
-Per head, per query type (pooled, iid, hole, extrapolation, duplicate) and per n bin (≤512, 512–1K, 1K–4K, 4K–16K, 16K–60K), as in design Training §3:
+Per head, per query type (pooled, iid, hole, extrapolation, duplicate) and per n bin (≤512, 512–1K, 1K–4K, 4K–16K, 16K–60K; n is the task's context size $n_{\text{ctx}}$), as in design Training §3. Slices, metric definitions and key names are shared with the bank's reference lines (`iltm2.train._metrics`): `val/<metric>_<head>/<slice>` next to `ref/<line>_<head>/<slice>`:
 
 - `val/mse_*` against the R_val = 128 target, and `val/xmse_*` from the two halves of 64;
 - `val/skill_*` (§8.1);
@@ -383,7 +389,7 @@ $$
 
 These thresholds are heuristics, not derived results. The grade that counts is T2's slope and intercept (`phase0_protocol.md` §6).
 
-- **First 2,500 steps:** both heads below the constant baseline.
+- **First 2,500 steps (mini-bank curve, §7.4):** both heads below the constant baseline. The first full validation comes at step 5,000; it should confirm this on the whole bank.
 - **End of stage 1:** both heads clearly below the e(q) proxy, pooled and on hole and extrapolation queries.
 - **Skill:** around 0.7 or more for $\hat A$ suggests it works. For $\hat E_{\text{dir}}$, 0.3–0.6 is plausible. $\hat E_{\text{dir}}$ skill below about 0.1 is not a bug: it is the ladder's signal that $h_*$ lacks the information, which is what A2 and B test (design, Architecture §4).
 - **Bias:** mean $\hat E_{\text{dir}}$ against mean $\hat t_E$ on the bank within a few percent.

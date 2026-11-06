@@ -77,40 +77,14 @@ from iltm2.model._entropy import crps
 from iltm2.prior._cut_graph_scm import CutGraphConfig, CutGraphSCM, NonFiniteReplicate, v2_prior_config
 from iltm2.prior._dataset import STREAM_REPLICATES, STREAM_SPLIT, STREAM_TASK, sample_task_shape, task_rng
 from iltm2.prior._filter import RejectionLog, ancestors
+from iltm2.prior._graph_scm_ref import PRETRAIN, graph_scm_task
 from iltm2.train._targets import t_aleatoric
 
 OUT = Path(__file__).resolve().parents[1] / "outputs" / "audits" / "difficulty_match"
 DEFAULT_CKPT = "/private/groups/ioannidislab/ajaras/tabicl-dev/tabicl-regressor-v2-20260212.ckpt"
-PRETRAIN = v2_prior_config(ensure_iid=False)   # unmodified graph_scm, exactly as TabICLv2 was trained
-
-
 # ------------------------------------------------------------------------------------------- unmodified graph_scm
-
-
-def graph_scm_task(shape, log):
-    """tabicl's `GraphPrior.generate_dataset` loop for one regression dataset, with rejections counted.
-
-    Same steps: GraphSCM -> delete_unique_features -> should_filter, retry on failure. tabicl pads X to
-    max_features; here max_features = d (no padding), as for the cut tasks, so both see the same columns.
-    GraphSCM's NaN guard replaces a dataset with a NaN in X or y by X = 0, y = -100 (tabicl then rejects it as
-    constant); it is detected here and logged as "non_finite", so the two priors' non-finite rates are comparable.
-    """
-    params = dict(regression=True, seq_len=shape.N, train_size=shape.n_ctx, num_features=shape.d,
-                  max_features=shape.d, config=PRETRAIN, device="cpu")
-    while True:
-        X, y = GraphSCM(**params)()
-        if bool(torch.all(y == -100.0)):                    # GraphSCM's NaN guard fired
-            log.reject("non_finite")
-            continue
-        X, d = Prior.delete_unique_features(X[None], torch.tensor([shape.d]))
-        if not (d > 0).all():
-            log.reject("constant_columns")
-            continue
-        if should_filter(X[0], y, PRETRAIN, is_classif=False):
-            log.reject("unpredictable")
-            continue
-        log.accepted += 1
-        return X[0, :, :int(d[0])], y
+# `graph_scm_task` (tabicl's generate_dataset loop with rejections counted) lives in iltm2.prior._graph_scm_ref,
+# shared with scripts/01b_check_val_bank.py.
 
 
 def graph_scm_y_ancestor_size(d):
