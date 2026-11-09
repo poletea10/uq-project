@@ -53,7 +53,24 @@ Gotchas found while building it:
 - A non-finite replicate is only seen after acceptance: `RejectionLog.revoke("non_finite_replicate", ...)` turns the task into a rejection, and the caller draws a new one (done in `00f`; step 4's dataset must do the same).
 - About 60% of accepted tasks are exactly deterministic (no private root reaches y, t_A ≡ 0); the `00b` tests that need noise pick a noisy task explicitly (`noisy_task`).
 
+Step 7 (heads, loss, metrics, validation): code written, gate not yet run.
+- `src/iltm2/model/_heads.py`: `Trunk` (512 -> 1024 -> 1, softplus; zero last layer, bias softplus^-1(mean target)), `LayerMix` (A2), `Head`, `HeadPair` (one configuration: Â and Ê_dir heads, own AdamW via `make_optimizer`, id like `A1_lr3e-4`), `Fork` (B: copy of the last k blocks + LN, `distance_from_init`), `build_a_job_heads`, `select_input`. In A2 each head has its OWN LayerMix (heads share no parameter, design Training §3). Init seeded by (seed, arm group, head): identical across LRs, shared by A1 and B.
+- `src/iltm2/train/_loss.py`: `batch_targets` (full + half-split targets of a group), `loss_weight` (exactly 1 for p = 0), `uq_loss`, `group_weight` (groups weighted by query rows).
+- `src/iltm2/train/_metrics.py` (added): `head_metrics` (val/ and mini/ keys, skill against the bank's const xMSE), `train_metrics`, `EMA`.
+- `src/iltm2/train/_validate.py`: `BankEvaluator` (bank or mini-bank; caches h / taps / fork input or recomputes per task; checks backbone sha, recomputed e(q) vs stored, task order), `BestTracker` (lowest pooled val MSE per pair and head, full bank only).
+- Gate: `scripts/00e_test_heads.sh` (CPU, short; uses the smoke bank's mini-bank and walks the real bank's records).
+- Step-8 design points, decided by the user: gradient clipping per head (`--clip_per head`, default; design §2/§6 updated), output-bias init from the first batch (`--init_bias warmup`, default).
+
+Step 7 gate passed (`00e_test_heads`: ALL OK). Guard lesson: the bank's e(q) recomputed on another device differs by float32 round-off (a few 1e-6 absolute, up to ~3e-4 relative at queries with tiny e(q)), so `BankEvaluator` checks e(q) against each task's mean e(q) (1e-3), not per query; on the A5500 it is bit-equal.
+
+Step 8 (A trainer): done, smoke run passed (`04_smoke_A`: ALL OK; overfit gate = final train MSE <= 5% of the step-0 MSE, the batch's noise floor only reported). Peak GPU memory and the projected A-job wall time are well inside the A5500 and the 4-day limit; one full-bank validation is roughly 25 min.
+- `src/iltm2/train/_config.py` (tabicl flag names; per-stage defaults 50000/4000/1000 steps, LR divisor 1/8/40), `_base.py` (`BaseTrainer`: stage start = skip if final.pt / resume from latest.pt / from the previous stage's final.pt with fresh optimizers / fresh stage 1; per-step loop with mini every 250, full bank every 5000 + stage end, best-per-head files + run-level best_index.json, latest.pt every 500 steps; trace.jsonl and summary.json per stage; reuses tabicl's `Timer` and `get_scheduler`), `frozen.py` (`FrozenTrainer`: one backbone pass per group feeds the 6 pairs; per-pair accumulated gradient weighted by query rows; `--overfit_steps` smoke mode).
+- Jobs (user's decision): ONE SLURM job per seed runs stages 1 -> 2 -> 3 in sequence (`scripts/train_A.sh <seed>`, 4 days on gpu); each stage writes `final.pt` once (never overwritten) and the next starts from it; a resubmitted job skips finished stages and resumes the current one.
+- Smoke (user's decision): ONE GPU job `scripts/04_smoke_A.sh`: overfit, stage 1 (200 steps, stopped at 100 and relaunched = resume test), stage 2 (50), stage 3 (20, full validation on the real bank for timing), then `scripts/04b_check_smoke.py`. Bank-vs-stream consistency is read in the first A job (train xMSE EMA vs mini-bank xMSE), not in a separate job.
+- For step 9 (user's decision): the fork's cosine end LR is 1e-8 in every stage (`--fork_cosine_lr_end`, already in `_config.py` for arm B; design §2/§6); the heads keep 1e-7. tabicl's `get_scheduler` takes lr_init from `optimizer.defaults["lr"]` and its end LR from `cosine_lr_end`, so the fork needs its own optimizer + scheduler (built with cosine_lr_end = fork_cosine_lr_end).
+
 ## Waiting on
 
 - The user's rerun of `sbatch experiment1_uq_heads/scripts/00d_test_backbone.sh` (padded-group check).
+- The user's launch of the A jobs (seeds 0, 1, 2; protocol §9), then reading bank-vs-stream consistency in A_seed0 (protocol §6 run 4).
 

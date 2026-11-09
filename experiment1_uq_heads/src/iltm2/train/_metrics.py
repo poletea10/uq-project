@@ -28,6 +28,14 @@ REFERENCE LINES (§8.1), per head and slice
                   with the bins fitted on the other half, so every query is scored out-of-fold and no task's own
                   targets enter its prediction)
     plus per slice: count, mean target, mean e(q), mean target ratio t/e(q), share of t_E < 0.
+
+HEAD METRICS (step 7: what the trainer logs; same slices, same names)
+    head_metrics     a head pair's predictions on the bank (val/...) or the mini-bank (mini/...): per head and
+                     slice mse, xmse, skill (against the bank's own constant-baseline xMSE), mean prediction; and the
+                     ratio pair val/ratio_A_eq/<s> and val/ratio_tA_eq/<s> (protocol §7.5)
+    train_metrics    one training step (protocol §7.3): mse and xmse per head against the 16-replicate targets,
+                     means of targets / predictions / e(q), share of t_E < 0
+    EMA              smoothing 0.99, bias-corrected, reset at each stage start (protocol §7.3)
 """
 from __future__ import annotations
 
@@ -137,3 +145,78 @@ def reference_lines(Q, const: Optional[Dict[str, float]] = None, eq_proxy: Optio
             out[f"{prefix}/ratio_t{h}_eq/{s}"] = ratio(t, e_q)
         out[f"{prefix}/frac_tE_neg/{s}"] = float((Q.t_E[mask] < 0).double().mean())
     return out
+
+
+# ------------------------------------------------------------------------------------------- head metrics (step 7)
+
+
+def head_metrics(preds: Dict[str, torch.Tensor], Q, refs: Dict[str, float], ref_prefix: str = "ref",
+                 prefix: str = "val", slices: Optional[tuple] = None) -> Dict[str, float]:
+    """A head pair's metrics on a query table, as a flat {key: float} dict (keys without the head id; the caller
+    prefixes it, protocol §7.1).
+
+    preds       {"A": Â, "E": Ê_dir}, each (Q,) in the query table's row order
+    refs        the table's reference lines (bank manifest["reference_lines"], or manifest["mini"]["reference_lines"]
+                with ref_prefix "ref_mini"): skill uses refs[f"{ref_prefix}/const_xmse_<h>/<slice>"]
+    slices      slice names to report (default: every non-empty slice; the mini-bank passes ("all",))
+    Keys: {prefix}/mse_<h>/<s>, {prefix}/xmse_<h>/<s>, {prefix}/skill_<h>/<s>, {prefix}/mean_<h>/<s>,
+          {prefix}/ratio_A_eq/<s>, {prefix}/ratio_tA_eq/<s>.
+    """
+    assert all(len(preds[h]) == len(Q) for h in HEADS), "one prediction per query row"
+    out: Dict[str, float] = {}
+    for s, mask in slice_masks(Q.query_type, Q.n_bin).items():
+        if (slices is not None and s not in slices) or not bool(mask.any()):
+            continue
+        for h in HEADS:
+            p = preds[h][mask]
+            t, ta, tb = (x[mask] for x in targets_of(Q, h))
+            x = xmse(p, ta, tb)
+            out[f"{prefix}/mse_{h}/{s}"] = mse(p, t)
+            out[f"{prefix}/xmse_{h}/{s}"] = x
+            c_x = refs.get(f"{ref_prefix}/const_xmse_{h}/{s}")
+            if c_x is not None:
+                out[f"{prefix}/skill_{h}/{s}"] = skill(x, c_x)
+            out[f"{prefix}/mean_{h}/{s}"] = float(p.double().mean())
+        e_q = Q.e_q[mask]
+        out[f"{prefix}/ratio_A_eq/{s}"] = ratio(preds["A"][mask], e_q)
+        out[f"{prefix}/ratio_tA_eq/{s}"] = ratio(Q.t_A[mask], e_q)
+    return out
+
+
+def train_metrics(A_hat: torch.Tensor, E_hat: torch.Tensor, T, e_q: torch.Tensor, prefix: str = "train"
+                  ) -> Dict[str, float]:
+    """Metrics of one training batch (protocol §7.3). T: `iltm2.train._loss.Targets` of the same queries. Computed
+    on the predictions made BEFORE the optimizer step, so each value is an evaluation on unseen tasks."""
+    A_hat, E_hat = A_hat.detach(), E_hat.detach()
+    out = {f"{prefix}/mse_A": mse(A_hat, T.t_A), f"{prefix}/mse_E": mse(E_hat, T.t_E),
+           f"{prefix}/xmse_A": xmse(A_hat, T.t_A_a, T.t_A_b), f"{prefix}/xmse_E": xmse(E_hat, T.t_E_a, T.t_E_b),
+           f"{prefix}/mean_A": float(A_hat.double().mean()), f"{prefix}/mean_E": float(E_hat.double().mean()),
+           f"{prefix}/mean_tA": float(T.t_A.double().mean()), f"{prefix}/mean_tE": float(T.t_E.double().mean()),
+           f"{prefix}/mean_eq": float(e_q.double().mean()),
+           f"{prefix}/frac_tE_neg": float((T.t_E < 0).double().mean())}
+    return out
+
+
+class EMA:
+    """Exponential moving average with bias correction: after n updates, sum_i beta^(n-i) (1-beta) x_i / (1-beta^n),
+    so a constant input gives that constant from the first update. `reset()` at each stage start (protocol §7.3)."""
+
+    def __init__(self, beta: float = 0.99):
+        self.beta, self.value, self.n = beta, 0.0, 0
+
+    def update(self, x: float) -> float:
+        self.n += 1
+        self.value = self.beta * self.value + (1.0 - self.beta) * float(x)
+        return self.get()
+
+    def get(self) -> float:
+        return self.value / (1.0 - self.beta ** self.n) if self.n else float("nan")
+
+    def reset(self):
+        self.value, self.n = 0.0, 0
+
+    def state_dict(self) -> dict:
+        return dict(beta=self.beta, value=self.value, n=self.n)
+
+    def load_state_dict(self, d: dict):
+        self.beta, self.value, self.n = d["beta"], d["value"], d["n"]

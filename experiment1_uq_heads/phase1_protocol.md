@@ -71,8 +71,9 @@ experiment1_uq_heads/
     ├── 01b_check_val_bank.py  # the bank checks of §3 step 6 (+ integrity, reproducibility), after 01
     ├── 02_benchmark_prior.py  # throughput per stage (§3, step 4)
     ├── 03_plot_split_tasks.py # split figures (§5)
-    ├── train_A.sh             # <stage> <seed> <wandb_key>
-    └── train_B.sh             # <stage> <head_lr> <fork_lr> <seed> <wandb_key>
+    ├── 04_smoke_A.sh          # the A trainer's smoke run, one GPU job (§6); ends with 04b_check_smoke.py
+    ├── train_A.sh             # <seed>: one A job, stages 1 → 2 → 3 in sequence (§7.2, §9)
+    └── train_B.sh             # <head_lr> <fork_lr> <seed>: one B job, same pattern (step 9)
 ```
 
 ### 1.3 Conventions
@@ -96,9 +97,14 @@ Code lives in git under `~/iLTM-bio/UQ_project/experiment1_uq_heads`. Everything
 ├── backbone/      TabICLv2 regressor checkpoint + sha256
 ├── val_bank/      2,000 tasks, sharded .pt + manifest.json (seed, git hashes, config, reference lines)
 │   └── mini/      the 64-task mini-bank (§7.4)
-├── runs/<run>/stage{1,2,3}/
-│   ├── latest.pt              # heads / fork + optimizers + schedulers + step + RNG state
-│   └── best/<head_id>_{A,E}.pt
+├── runs/<run>/
+│   ├── best_index.json        # where each head's current best checkpoint lives (stage, global step, val MSE)
+│   └── stage{1,2,3}/
+│       ├── latest.pt          # heads / fork + optimizers + schedulers + EMAs + best tracker + step (resume)
+│       ├── final.pt           # end of the stage: written once, NEVER overwritten; the next stage starts from it
+│       ├── best/<head_id>_{A,E}.pt   # best head so far (pooled full-bank val MSE), reached in this stage
+│       ├── trace.jsonl        # per step: LR per pair, batch fingerprint, launch id, global step
+│       └── summary.json       # timings, peak GPU memory, projected stage wall time
 ├── wandb/         WANDB_DIR
 ├── slurm_logs/
 └── audits/        split figures (§5), throughput tables, smoke-run outputs
@@ -123,7 +129,7 @@ Each step has a gate that must pass before the next one starts.
 | 5 | `_backbone.py` | Backbone tests of §4.4 pass |
 | 6 | `01_make_val_bank.py` | Bank checks below pass; reference lines stored in the manifest |
 | 7 | `_heads.py`, `_loss.py`, `_metrics.py`, `_validate.py` | Head tests of §4.5 pass |
-| 8 | `frozen.py` + `train_A.sh` | Smoke runs of §6 pass → launch A jobs (§9) |
+| 8 | `_config.py`, `_base.py`, `frozen.py`, `train_A.sh` | The smoke run of §6 passes (`04_smoke_A.sh`) → launch A jobs (§9) |
 | 9 | `fork.py` + `train_B.sh` | Fork equals $h_*$ at step 0; smoke runs on B → launch B jobs (§9) |
 
 The validation bank (step 6) comes **before** any trainer, because the trainer logs against it from step 0 and the reference lines are what make a loss value readable (§8).
@@ -262,12 +268,13 @@ Save to `audits/split_figures/task{01..10}.png`. These figures also go into the 
 
 ## 6. Smoke runs before the long jobs
 
-GPU, minutes each. All four must pass before launching the A jobs; runs 1, 2 and 3 are repeated for B before launching the B jobs.
+**One GPU job** (`scripts/04_smoke_A.sh`, about 1–2 h), because every GPU job waits in the queue: runs 1–3 below run in sequence inside it and it stops at the first failure, so an `afterok` dependency can hold the A jobs on it. It must pass before the A jobs train; for B the same job is repeated with the fork trainer (step 9). Run 4 is read in the first A job, not in a separate job.
 
-1. **Overfit one fixed batch.** Train the heads for 500 steps on a single fixed batch. The training MSE must fall far below the bank's noise floor (§8.1): the heads can memorize their targets from the embeddings, so the plumbing from batch to backbone to heads to loss works.
-2. **200 steps per stage at real sizes**, including stage 3 at N = 60K and, for B, gradient checkpointing. Record peak GPU memory, seconds per step and `prior_time` vs `train_time`, then extrapolate the wall time of each stage. These runs log to a `debug` wandb project, which also checks the logging of §7.
-3. **Resume.** Kill a run at step 100 and relaunch it. It must continue at step 100 with the same LR, the same batch at step 101 and the same wandb run (§7.1).
-4. **Bank-versus-stream consistency**, after the first few thousand stage-1 steps. Compare the EMA of the training xMSE (§7.3) with the validation xMSE on the bank's **small bin** (N = 1,024, the stage-1 shape), per head.
+1. **Overfit one fixed batch.** The first stage-1 micro-batch group with a noisy task, backbone outputs computed once, every pair trained 3,000 full-batch steps. Each head's training MSE must fall to at most 5% of its step-0 value, the constant-baseline MSE every head starts from: the heads can memorize their targets from the embeddings, so the plumbing from batch to backbone to heads to loss works. The batch's replicate-noise floor $\overline{\hat t^{\,2}-\hat t^{(a)}\hat t^{(b)}}$ is reported, not gated: deterministic tasks have noise-free $\hat t_E$, so the $\hat t_E$ floor sits far below $\hat t_E$'s spread, and a floor-based bar would ask the E head for a far larger reduction than the A head.
+2. **Short stages at real sizes:** stage 1 for 200 steps, stage 2 for 50, stage 3 for 20 (N up to 60K; for B, with gradient checkpointing), each starting from the previous stage's `final.pt`. Record peak GPU memory, seconds per step, `prior_time` vs `train_time`, and the time of one full-bank validation (stage 3 validates on the real bank; stages 1–2 on the small smoke bank, to keep the job short), then extrapolate the wall time of a full job. The step-4 benchmark measured the prior and the bare backbone forward; this run adds what it could not: the heads' forward and backward for all pairs, the 12 taps in memory, validation and checkpointing. Logs to the `iLTMv2` wandb project as run `smoke_A_<jobid>` in group `smoke` (tag `smoke`), which also checks the logging of §7; the real A jobs log to the same project in group `A`.
+3. **Resume**, inside run 2 at no extra cost: stage 1 is stopped after 100 steps (`--stop_after 100`, which saves `latest.pt` as a killed job would) and relaunched. It must continue at step 100 with every pair's LR on tabicl's schedule, the batches of steps 100 and 101 bit-identical to the same steps rebuilt from (seed, stage, step), and the same wandb run (§7.1).
+   `scripts/04b_check_smoke.py` checks runs 2–3 at the end of the job, and also that each stage's `final.pt` is unchanged after the later stages (never overwritten) and that the stages chain (each starts from the previous `final.pt`, global steps continuous).
+4. **Bank-versus-stream consistency**, read in the first A job (seed 0) after the first few thousand stage-1 steps: no separate job. Compare the EMA of the training xMSE (§7.3) with the mini-bank xMSE (§7.4: 64 tasks of N = 1,024, the stage-1 shape, logged every 250 steps), per head and pair.
    - **Why both sides are comparable.** Both are noise-free in expectation, so no floor correction is needed. Training losses are computed **before** the optimizer step, so each training value is an evaluation on tasks the head has not yet trained on.
    - **What the test detects.** Each training task is seen once, so there is no stream to overfit. A gap means the bank and the stream are generated differently: a different shape distribution, filter, query mixture or transform.
    - **Gate:** the two curves agree within their noise.
@@ -288,36 +295,19 @@ Each job (A job *s*, or one B configuration) is **one wandb run spanning stages 
 
 ### 7.2 Script
 
-The wandb key is passed as a positional argument and exported, never passed as a Python flag:
+**One SLURM job per A seed runs the three stages in sequence** (`scripts/train_A.sh <seed>`), each stage as its own `python -m iltm2.train.frozen --stage s` process. Three jobs chained with `afterok` would wait in the queue three times, and on this cluster a job held by a dependency gains no queue priority while it waits; one job waits once. The job asks for 4 days of the `gpu` partition (7-day limit): a full A job is projected at about 2.5 days (the smoke run prints the measured projection).
+
+- **Per-stage settings come from the trainer, not the script** (`iltm2.train._config`): steps 50,000 / 4,000 / 1,000, LR divisor 1 / 8 / 40, and the stage's shapes from `iltm2.prior._dataset.STAGES`. The other defaults are design Training §6 (AdamW, weight decay 1e-5, clipping 5.0, `cosine_with_restarts` with 1% warmup to `cosine_lr_end` 1e-7 via tabicl's own `get_scheduler` (B's fork: 1e-8, `--fork_cosine_lr_end`), clipping per head (`--clip_per head`), output biases from the first batch (`--init_bias warmup`), `--muon False`). Extra flags after the seed are passed to every stage.
+- **How a stage starts** (`iltm2.train._base`): if its `final.pt` exists it is done and skipped; if its `latest.pt` exists it resumes with the full optimizer state; otherwise stage s > 1 loads the heads (and the best tracker) from stage s−1's `final.pt` with fresh optimizers and schedulers, tabicl's `--only_load_model` restart (`scripts/train_v2_reg_stage2.sh`). So after a timeout or a crash the same `sbatch` command continues where the job stopped.
+- **The global step** of a stage starts at the previous stage's final global step (§7.1).
+- **wandb key:** kept in a netrc of its own, `~/.wandb_uq/netrc`, created once with `mkdir -p ~/.wandb_uq && NETRC=~/.wandb_uq/netrc wandb login`. The job scripts export `NETRC` to it (wandb reads `$NETRC` before `~/.netrc`), so the shared `~/.netrc`, which holds another account's key on this login, is never read or overwritten; `WANDB_NETRC=<path>` selects another file. Never pass the key as an argument (visible to other users through `scontrol show job`) or write it into a committed file.
 
 ```bash
-#!/bin/bash
-# usage: sbatch train_A.sh <stage> <seed> <wandb_api_key>
-STAGE=$1; SEED=$2; export WANDB_API_KEY=$3
-ROOT=/private/groups/ioannidislab/UQ_decoupling_exp
-export PYTHONHASHSEED=0 WANDB_DIR=$ROOT/wandb
-case $STAGE in
-  1) STEPS=50000; OFFSET=0;     MIN_N=1024; MAX_N=1024;  TR_MIN=0.30; TR_MAX=0.90; LR_DIV=1  ;;
-  2) STEPS=4000;  OFFSET=50000; MIN_N=400;  MAX_N=10240; TR_MIN=0.79; TR_MAX=0.81; LR_DIV=8  ;;
-  3) STEPS=1000;  OFFSET=54000; MIN_N=400;  MAX_N=60000; TR_MIN=0.79; TR_MAX=0.81; LR_DIV=40 ;;
-esac
-RUN=A_seed$SEED; CKPT_DIR=$ROOT/runs/$RUN/stage$STAGE
-# RESUME_ARGS: tabicl pattern (scripts/train_v2_reg_stage2.sh) — load the previous stage's weights
-# only on the first launch of a stage; later launches resume from CKPT_DIR with full optimizer state.
-python -m iltm2.train.frozen --stage $STAGE --seed $SEED --max_steps $STEPS --step_offset $OFFSET \
-  --min_seq_len $MIN_N --max_seq_len $MAX_N --min_train_size $TR_MIN --max_train_size $TR_MAX \
-  --head_lrs 1e-4 3e-4 1e-3 --lr_divisor $LR_DIV \
-  --weight_decay 1e-5 --gradient_clipping 5.0 --muon False \
-  --scheduler cosine_with_restarts --cosine_num_cycles 1 --warmup_proportion 0.01 --cosine_lr_end 1e-7 \
-  --backbone_path $ROOT/backbone/tabicl_reg_v2.ckpt --val_bank $ROOT/val_bank \
-  --checkpoint_dir $CKPT_DIR \
-  --wandb_log True --wandb_mode online --wandb_project iltmv2-phase1 \
-  --wandb_name $RUN --wandb_id $RUN $RESUME_ARGS
+sbatch -J A_seed0 experiment1_uq_heads/scripts/train_A.sh 0
+STAGES="2 3" sbatch -J A_seed0 experiment1_uq_heads/scripts/train_A.sh 0      # a subset of the stages
 ```
 
-`train_B.sh` is the same, with `--fork_lr`, `--k 2` and one head LR, and runs `iltm2.train.fork`.
-
-With `sbatch`, positional arguments are visible to other cluster users through `scontrol show job`. If that matters on this cluster, run `wandb login` once instead (the key is stored in `~/.netrc`) and drop the argument. Never write the key into a committed file.
+`train_B.sh` follows the same pattern, with the fork LR and one head LR, and runs `iltm2.train.fork` (step 9).
 
 ### 7.3 Training metrics (every step, per head)
 
@@ -410,13 +400,20 @@ These thresholds are heuristics, not derived results. The grade that counts is T
 
 ## 9. Launch plan
 
-Following design Training §4–5. Every job runs stages 1 → 2 → 3 as three launches of the same script into the same wandb run (§7.1).
+Following design Training §4–5. Every job runs stages 1 → 2 → 3 in sequence inside one SLURM job, into one wandb run (§7.1, §7.2). The smoke run (§6) goes first; the A jobs can be submitted at the same time, held on it by a dependency, so they start as soon as it passes and never if it fails:
+
+```bash
+SMOKE=$(sbatch --parsable experiment1_uq_heads/scripts/04_smoke_A.sh)
+for S in 0 1 2; do
+  sbatch -J A_seed$S --dependency=afterok:$SMOKE --kill-on-invalid-dep=yes experiment1_uq_heads/scripts/train_A.sh $S
+done
+```
 
 | Round | Jobs | Command |
 |---|---|---|
-| 1 | A, seeds 0, 1, 2 (each: 3 A1 + 3 A2 head pairs) | `sbatch train_A.sh <stage> <seed> <key>` |
-| 1 | B, seed 0, 9 configurations (head LR × fork LR) | `sbatch train_B.sh <stage> <head_lr> <fork_lr> 0 <key>` |
-| 2 | B's winner on seeds 1, 2, only if B clearly improves on A1/A2 | `sbatch train_B.sh <stage> <head_lr> <fork_lr> <seed> <key>` |
+| 1 | A, seeds 0, 1, 2 (each: 3 A1 + 3 A2 head pairs) | `sbatch -J A_seed<s> train_A.sh <seed>` |
+| 1 | B, seed 0, 9 configurations (head LR × fork LR) | `sbatch train_B.sh <head_lr> <fork_lr> 0` |
+| 2 | B's winner on seeds 1, 2, only if B clearly improves on A1/A2 | `sbatch train_B.sh <head_lr> <fork_lr> <seed>` |
 | (cond.) | B's winner with Muon on the fork's 2-D matrices, only if B wins (design, Training §2) | `train_B.sh` with `--fork_muon True` |
 
 Selection (per head within A1/A2, whole configuration in B, arm by mixed score, then best seed) follows design Training §3–4 and reads the **validation** metrics of §7.5. After selection, iLTMv2 runs on every Phase 0 test (proposal §4.10), through the same forward route.
