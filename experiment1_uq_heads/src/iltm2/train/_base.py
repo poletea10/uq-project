@@ -155,6 +155,12 @@ class BaseTrainer:
     def mini_extra_logs(self) -> Dict[str, float]:
         return {}
 
+    def preflight(self):
+        """Checks run once at a fresh stage 1, before the stream starts (arm B: peak memory at the largest shape)."""
+
+    def check_first_batch(self, groups: List[UQBatch]):
+        """Checks on the first batch of a fresh stage 1, before any training (arm B: fork output = h_star)."""
+
     def best_payload(self, head_id: str, h: str) -> dict:
         raise NotImplementedError
 
@@ -308,6 +314,9 @@ class BaseTrainer:
                 init_bias_pending = True
             print(f"stage 1 of {a.run_name}: fresh heads (seed {a.seed}), output bias from "
                   f"{'the first batch' if init_bias_pending else 'the bank constants'}", flush=True)
+        fresh = a.stage == 1 and self.step == 0
+        if fresh:
+            self.preflight()
         self._init_wandb()
         full_ev, mini_ev = self.build_evaluators()
 
@@ -325,6 +334,8 @@ class BaseTrainer:
                 for g in groups:
                     self.rejections["accepted"] += g.log.accepted
                     self.rejections["rejected"] += sum(g.log.rejected.values())
+                if fresh and step == 0:
+                    self.check_first_batch(groups)
                 if init_bias_pending:
                     self.init_output_bias(*self.warmup_means(groups))
                     init_bias_pending = False

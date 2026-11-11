@@ -41,19 +41,26 @@ def build_parser(arm: str = "A") -> argparse.ArgumentParser:
     g = p.add_argument_group("job")
     g.add_argument("--stage", type=int, choices=(1, 2, 3), default=1)
     g.add_argument("--seed", type=int, default=0, help="fixes the task stream and the heads' initialization")
-    g.add_argument("--run_name", default=None, help="default: A_seed<seed>; the run directory and the wandb id")
+    g.add_argument("--run_name", default=None,
+                   help="default: A_seed<seed> / B_h<head_lr>_f<fork_lr>_seed<seed>; the run directory and the wandb id")
     g.add_argument("--runs_root", default=str(RUNS_ROOT))
     g.add_argument("--device", default="cuda")
 
     g = p.add_argument_group("schedule and optimizer (design Training §2)")
     g.add_argument("--max_steps", type=int, default=None, help="steps of this stage (default 50000 / 4000 / 1000)")
     g.add_argument("--lr_divisor", type=float, default=None, help="max LR = swept LR / divisor (default 1 / 8 / 40)")
-    g.add_argument("--head_lrs", type=float, nargs="+", default=[1e-4, 3e-4, 1e-3], help="stage-1 head LRs")
+    g.add_argument("--head_lrs", type=float, nargs="+", default=[1e-4, 3e-4, 1e-3],
+                   help="stage-1 head LRs (arm B: exactly one)")
     g.add_argument("--weight_decay", type=float, default=1e-5)
     g.add_argument("--gradient_clipping", type=float, default=5.0)
-    g.add_argument("--clip_per", choices=("head", "pair"), default="head",
-                   help="clip each head on its own gradient norm (default: the A and E heads stay fully "
-                        "independent, design §6) or each head pair on their joint norm")
+    if arm == "A":
+        g.add_argument("--clip_per", choices=("head", "pair"), default="head",
+                       help="clip each head on its own gradient norm (default: the A and E heads stay fully "
+                            "independent, design §6) or each head pair on their joint norm")
+    else:
+        g.add_argument("--clip_per", choices=("joint", "separate"), default="joint",
+                       help="clip fork + both heads on their joint gradient norm (default, design §6: in B the heads "
+                            "share the fork) or the fork and each head separately")
     g.add_argument("--scheduler", choices=("cosine_with_restarts",), default="cosine_with_restarts")
     g.add_argument("--warmup_proportion", type=float, default=0.01)
     g.add_argument("--warmup_steps", type=int, default=0, help="used only if --warmup_proportion < 0 (tabicl)")
@@ -67,6 +74,11 @@ def build_parser(arm: str = "A") -> argparse.ArgumentParser:
         g.add_argument("--fork_cosine_lr_end", type=float, default=1e-8,
                        help="end LR of the fork's cosine schedule, every stage (design §2: the fork's stage-3 max "
                             "LR goes down to 3e-6 / 40 = 7.5e-8, below the heads' 1e-7)")
+        g.add_argument("--recompute_above", type=int, default=20_000,
+                       help="gradient checkpointing in the fork for tasks of more rows (design Training §2)")
+        g.add_argument("--preflight", type=str2bool, default=True,
+                       help="at a fresh stage 1: check fork output = h_star on the first batch, and run one fork "
+                            "forward/backward on the largest stage-3 task shape (N = 60,000) to measure peak memory")
 
     g = p.add_argument_group("loss (design Architecture §3)")
     g.add_argument("--loss_p", type=float, default=0.0, help="weight exponent p (0 = unweighted, the default)")
@@ -115,12 +127,21 @@ def finalize(args: argparse.Namespace, arm: str = "A") -> argparse.Namespace:
         args.max_steps = STAGE_STEPS[args.stage]
     if args.lr_divisor is None:
         args.lr_divisor = LR_DIVISOR[args.stage]
+    if arm == "B":
+        assert len(args.head_lrs) == 1, "arm B trains one head LR per job (--head_lrs <one value>)"
+        assert args.overfit_steps == 0, "the overfit smoke test is only implemented for arm A"
     if args.run_name is None:
-        args.run_name = f"{arm}_seed{args.seed}"
+        from iltm2.model._heads import fmt_lr
+        args.run_name = (f"A_seed{args.seed}" if arm == "A" else
+                         f"B_h{fmt_lr(args.head_lrs[0])}_f{fmt_lr(args.fork_lr)}_seed{args.seed}")
     args.wandb_name = args.wandb_name or args.run_name
     args.wandb_id = args.wandb_id or args.run_name
     args.wandb_group = args.wandb_group or arm
-    args.wandb_tags = args.wandb_tags if args.wandb_tags is not None else [f"arm_{arm}"]
+    if args.wandb_tags is None:
+        args.wandb_tags = [f"arm_{arm}"]
+        if arm == "B":
+            from iltm2.model._heads import fmt_lr
+            args.wandb_tags += [f"head_lr_{fmt_lr(args.head_lrs[0])}", f"fork_lr_{fmt_lr(args.fork_lr)}"]
     if args.loss_p > 0:
         assert args.loss_c is not None and args.loss_c > 0, "--loss_p > 0 needs --loss_c > 0"
     min_lr = min(args.head_lrs) / args.lr_divisor

@@ -124,12 +124,15 @@ class HeadPair(nn.Module):
     arm     "A1" (input h_star), "A2" (input taps), "B" (input the fork's output)
     lr      the stage-1 max LR of this pair (stages 2-3 divide it by 8 and 40: design Training §2)
     seed    the job seed: fixes the trunks' initialization (module docstring)
+    name    a fixed id instead of '<arm>_lr<lr>' (B jobs use 'B', so the 9 B runs share their wandb keys and are
+            told apart by their config)
     """
 
-    def __init__(self, arm: str, lr: float, seed: int, d: int = D_MODEL, hidden: int = HIDDEN, n_layers: int = 12):
+    def __init__(self, arm: str, lr: float, seed: int, d: int = D_MODEL, hidden: int = HIDDEN, n_layers: int = 12,
+                 name: Optional[str] = None):
         super().__init__()
         assert arm in ARMS, arm
-        self.arm, self.lr, self.seed = arm, float(lr), int(seed)
+        self.arm, self.lr, self.seed, self.name = arm, float(lr), int(seed), name
         heads = {}
         for i, h in enumerate(HEADS):
             with seeded(seed, _INIT_GROUP[arm], i):
@@ -138,7 +141,7 @@ class HeadPair(nn.Module):
 
     @property
     def head_id(self) -> str:
-        return f"{self.arm}_lr{fmt_lr(self.lr)}"
+        return self.name or f"{self.arm}_lr{fmt_lr(self.lr)}"
 
     def head(self, h: str) -> Head:
         return self.A if h == "A" else self.E

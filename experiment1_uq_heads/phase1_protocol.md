@@ -130,7 +130,7 @@ Each step has a gate that must pass before the next one starts.
 | 6 | `01_make_val_bank.py` | Bank checks below pass; reference lines stored in the manifest |
 | 7 | `_heads.py`, `_loss.py`, `_metrics.py`, `_validate.py` | Head tests of §4.5 pass |
 | 8 | `_config.py`, `_base.py`, `frozen.py`, `train_A.sh` | The smoke run of §6 passes (`04_smoke_A.sh`) → launch A jobs (§9) |
-| 9 | `fork.py` + `train_B.sh` | Fork equals $h_*$ at step 0; smoke runs on B → launch B jobs (§9) |
+| 9 | `fork.py` + `train_B.sh` | No separate smoke job (§6): each B job checks at its start that the fork equals $h_*$ on the first batch and that one fork forward/backward fits at the largest stage-3 shape → launch the 9 B jobs (§9) |
 
 The validation bank (step 6) comes **before** any trainer, because the trainer logs against it from step 0 and the reference lines are what make a loss value readable (§8).
 
@@ -268,7 +268,7 @@ Save to `audits/split_figures/task{01..10}.png`. These figures also go into the 
 
 ## 6. Smoke runs before the long jobs
 
-**One GPU job** (`scripts/04_smoke_A.sh`, about 1–2 h), because every GPU job waits in the queue: runs 1–3 below run in sequence inside it and it stops at the first failure, so an `afterok` dependency can hold the A jobs on it. It must pass before the A jobs train; for B the same job is repeated with the fork trainer (step 9). Run 4 is read in the first A job, not in a separate job.
+**One GPU job** (`scripts/04_smoke_A.sh`, about 1–2 h), because every GPU job waits in the queue: runs 1–3 below run in sequence inside it and it stops at the first failure, so an `afterok` dependency can hold the A jobs on it. It must pass before the A jobs train; B has no smoke job of its own (user's decision): the B trainer shares the stage, resume and checkpoint logic tested here, and each B job runs its two B-specific checks when it starts (`iltm2.train.fork`: `preflight`, one fork forward/backward at N = 60,000 with gradient checkpointing, printing peak GPU memory; `check_first_batch`, the fork's output equal to $h_*$ on the first batch within 1e-5). Both print an `OK` line to the job's `.out`, and a failure stops the job before any training. Run 4 is read in the first A job, not in a separate job.
 
 1. **Overfit one fixed batch.** The first stage-1 micro-batch group with a noisy task, backbone outputs computed once, every pair trained 3,000 full-batch steps. Each head's training MSE must fall to at most 5% of its step-0 value, the constant-baseline MSE every head starts from: the heads can memorize their targets from the embeddings, so the plumbing from batch to backbone to heads to loss works. The batch's replicate-noise floor $\overline{\hat t^{\,2}-\hat t^{(a)}\hat t^{(b)}}$ is reported, not gated: deterministic tasks have noise-free $\hat t_E$, so the $\hat t_E$ floor sits far below $\hat t_E$'s spread, and a floor-based bar would ask the E head for a far larger reduction than the A head.
 2. **Short stages at real sizes:** stage 1 for 200 steps, stage 2 for 50, stage 3 for 20 (N up to 60K; for B, with gradient checkpointing), each starting from the previous stage's `final.pt`. Record peak GPU memory, seconds per step, `prior_time` vs `train_time`, and the time of one full-bank validation (stage 3 validates on the real bank; stages 1–2 on the small smoke bank, to keep the job short), then extrapolate the wall time of a full job. The step-4 benchmark measured the prior and the bare backbone forward; this run adds what it could not: the heads' forward and backward for all pairs, the 12 taps in memory, validation and checkpointing. Logs to the `iLTMv2` wandb project as run `smoke_A_<jobid>` in group `smoke` (tag `smoke`), which also checks the logging of §7; the real A jobs log to the same project in group `A`.
@@ -292,6 +292,7 @@ Each job (A job *s*, or one B configuration) is **one wandb run spanning stages 
 - **Global step.** Logged steps are offset by the earlier stages: stage 1 runs 0–50,000, stage 2 runs 50,000–54,000, stage 3 runs 54,000–55,000. Log `stage` as a metric, so stage boundaries are visible.
 - **Config.** `vars(args)` plus the git hashes of `iltm2` and tabicl and the backbone's sha256.
 - **Key namespacing in A jobs.** One process trains 6 head pairs, so every metric is prefixed by the head id, e.g. `A1_lr3e-4/val/xmse_E/hole`.
+- **B jobs** train one pair, named `B`, so all 9 configurations log the same keys (`B/val/xmse_E/hole`, plus `B/train/grad_norm_fork`, `B/train/lr_fork`, `B/train/fork_dist_from_init`) and are told apart by their config (`head_lrs`, `fork_lr`) and tags (`head_lr_*`, `fork_lr_*`, group `B`): one panel per metric overlays the 9 runs.
 
 ### 7.2 Script
 
@@ -409,10 +410,18 @@ for S in 0 1 2; do
 done
 ```
 
+The B round (arm B, seed 0, paired with `A_seed0`'s task stream):
+
+```bash
+for H in 1e-4 3e-4 1e-3; do for F in 3e-6 1e-5 3e-5; do
+  sbatch -J B_h${H}_f${F}_s0 experiment1_uq_heads/scripts/train_B.sh $H $F 0
+done; done
+```
+
 | Round | Jobs | Command |
 |---|---|---|
 | 1 | A, seeds 0, 1, 2 (each: 3 A1 + 3 A2 head pairs) | `sbatch -J A_seed<s> train_A.sh <seed>` |
-| 1 | B, seed 0, 9 configurations (head LR × fork LR) | `sbatch train_B.sh <head_lr> <fork_lr> 0` |
+| 1 | B, seed 0, 9 configurations (head LR × fork LR) | `sbatch -J B_h<H>_f<F>_s0 train_B.sh <head_lr> <fork_lr> 0` (loop below) |
 | 2 | B's winner on seeds 1, 2, only if B clearly improves on A1/A2 | `sbatch train_B.sh <head_lr> <fork_lr> <seed>` |
 | (cond.) | B's winner with Muon on the fork's 2-D matrices, only if B wins (design, Training §2) | `train_B.sh` with `--fork_muon True` |
 

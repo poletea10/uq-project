@@ -69,8 +69,11 @@ Step 8 (A trainer): done, smoke run passed (`04_smoke_A`: ALL OK; overfit gate =
 - Smoke (user's decision): ONE GPU job `scripts/04_smoke_A.sh`: overfit, stage 1 (200 steps, stopped at 100 and relaunched = resume test), stage 2 (50), stage 3 (20, full validation on the real bank for timing), then `scripts/04b_check_smoke.py`. Bank-vs-stream consistency is read in the first A job (train xMSE EMA vs mini-bank xMSE), not in a separate job.
 - For step 9 (user's decision): the fork's cosine end LR is 1e-8 in every stage (`--fork_cosine_lr_end`, already in `_config.py` for arm B; design §2/§6); the heads keep 1e-7. tabicl's `get_scheduler` takes lr_init from `optimizer.defaults["lr"]` and its end LR from `cosine_lr_end`, so the fork needs its own optimizer + scheduler (built with cosine_lr_end = fork_cosine_lr_end).
 
+Step 9 (B trainer): code written, not run. `src/iltm2/train/fork.py` (`ForkTrainer` on `BaseTrainer`): frozen backbone with fork_k = 2 (no taps), `Fork` (copy of blocks 11-12 + LN) feeding one `HeadPair` named "B" (all B runs share wandb keys `B/...`); two AdamW optimizers + tabicl schedules (heads end 1e-7, fork end 1e-8); gradient checkpointing in the fork above 20K rows; clipping fork + heads jointly (`--clip_per joint`, design §6; `separate` optional); best-A / best-E checkpoints store the whole model (fork + both heads); mini-bank caches the fork input. No B smoke job (user's decision): at a fresh stage 1 each job runs `preflight` (one fork forward/backward at N = 60,000, peak memory) and `check_first_batch` (fork output = h_star within 1e-5), printing OK lines; failures stop the job. `scripts/train_B.sh <head_lr> <fork_lr> <seed>` runs stages 1 -> 2 -> 3 in one 4-day job; run name `B_h<H>_f<F>_seed<S>`. Round 1 = the 9 configurations on seed 0 (protocol §9 loop).
+
 ## Waiting on
 
+- The user's launch of the 9 B jobs (seed 0; protocol §9), then their stage-1 summary.json for B's measured step time and memory.
 - The user's rerun of `sbatch experiment1_uq_heads/scripts/00d_test_backbone.sh` (padded-group check).
 - The user's launch of the A jobs (seeds 0, 1, 2; protocol §9), then reading bank-vs-stream consistency in A_seed0 (protocol §6 run 4).
 
