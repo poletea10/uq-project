@@ -15,15 +15,18 @@ import config
 import toy
 import truth
 
-METHODS = ("hgp", "tabiclv2")
-TOY_METHODS = ("hgp",)            # T1 rows; Dec-ICL and iLTMv2 join when their adapters exist
+METHODS = ("hgp", "tabiclv2", "iltmv2", "iltmv2_a1", "iltmv2_b")
+TOY_METHODS = ("hgp", "iltmv2", "iltmv2_a1", "iltmv2_b")   # T1 rows; Dec-ICL joins when its adapter exists
 TOTAL_ONLY = ("tabiclv2",)        # backbone check only
+# Methods sharing an adapter module, told apart by their configs/methods.yaml entry: iltmv2 = the A2 checkpoints
+# (the paper figure's iLTMv2 column), iltmv2_a1 = the A1 checkpoints, iltmv2_b = the B checkpoint.
+ADAPTER_MODULE = {"iltmv2_a1": "iltmv2", "iltmv2_b": "iltmv2"}
 QUANTILE_LEVELS = (0.05, 0.5, 0.95)
 
 
 def adapter(method):
     assert method in METHODS, f"unknown method {method}; choose from {METHODS}"
-    return importlib.import_module(f"adapters.{method}")
+    return importlib.import_module(f"adapters.{ADAPTER_MODULE.get(method, method)}")
 
 
 def fit_rng(proto, tcfg, rung_k, n):

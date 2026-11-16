@@ -71,6 +71,7 @@ experiment1_uq_heads/
     ├── 01b_check_val_bank.py  # the bank checks of §3 step 6 (+ integrity, reproducibility), after 01
     ├── 02_benchmark_prior.py  # throughput per stage (§3, step 4)
     ├── 03_plot_split_tasks.py # split figures (§5)
+    ├── 05_export_runs.py      # the runs' key metrics as CSVs for analysis (§9.3)
     ├── 04_smoke_A.sh          # the A trainer's smoke run, one GPU job (§6); ends with 04b_check_smoke.py
     ├── train_A.sh             # <seed>: one A job, stages 1 → 2 → 3 in sequence (§7.2, §9)
     └── train_B.sh             # <head_lr> <fork_lr> <seed>: one B job, same pattern (step 9)
@@ -82,7 +83,11 @@ experiment1_uq_heads/
 - **Single GPU, no DDP.** The backbone runs under `torch.no_grad()`, so the only memory pressure is arm B at large N, which gradient checkpointing handles (design, Training §2).
 - **`UQBatch`** is a small dataclass: `X, y_ctx, y_reps (m × R), query_type (m,), d, seq_len, train_size`. Tabicl's micro-batch rule still applies (`validate_micro_batch`): one `(seq_len, train_size)` per micro-batch, so the task shape is sampled per micro-batch group.
 - **Deterministic task stream.** Each task's RNG depends only on `(seed, step, task_idx)`, never on the number of DataLoader workers. This makes A job *s* and the B jobs on seed *s* see the same tasks (design, Training §5) and makes resuming exact. Fix `PYTHONHASHSEED` in every job (proposal §4.3).
-- **Forward route.** One raw training-mode forward, no `TabICLRegressor` ensemble, everywhere (design, Architecture §1, "Forward route").
+- **Forward route.** One raw training-mode forward, no `TabICLRegressor` ensemble, everywhere (design, Architecture §1, "Forward route"): training, validation, the bank, and inference (`iltm2.inference.ILTMv2Regressor`, Phase 0).
+  - *"Training mode" is only PyTorch's module flag.* Every forward runs under `torch.no_grad()` with no optimizer step, so nothing is trained, and dropout is 0 in TabICLv2, so the forward is deterministic.
+  - *Why not eval mode.* In eval mode tabicl's `ICLearning.forward` switches to `_inference_forward`, a different path built for `TabICLRegressor`: automatic batching, optional CPU offloading and **mixed precision** (`use_amp=True` by default). It is a cheaper, lower-precision approximation of the same function, not a more correct one. The training-mode path is the fp32 computation TabICLv2 was pretrained with.
+  - *Why it must stay the same everywhere.* The heads' targets, the validation bank and every validation number are computed on this exact forecast, and $\hat E_{\text{dir}}$ is trained to predict *its* divergence. A forward in eval mode would perturb $q_\theta$ and $h_*$ by mixed-precision rounding, and the heads would be evaluated against a forecast they were never trained on. Switching to eval mode would require rebuilding the bank and retraining, and would gain no accuracy.
+  - *Which modules it concerns.* `FrozenBackbone` refuses an eval-mode backbone. B's fork (copies of tabicl blocks) runs in training mode in training, validation and inference alike. The A1/A2 heads (Linear, GELU, LayerNorm, softplus) behave identically in both modes.
 - **Optimizer.** AdamW, weight decay 1e-5, gradient clipping 5.0, β = (0.9, 0.999), following DecoupledPFN App. B.3. Muon is not inherited from TabICLv2's scripts (design, Training §2). If tabicl flags are reused, pass `--muon False`.
 - **Precomputed bank targets.** The PPD is frozen in every arm, so the bank's targets ($\hat t_A$, $\hat t_E$, their half-split versions) and $e(q_\theta)$ never change. They are stored once with the bank. Validation is then a backbone forward plus the heads. In A jobs, cache the bank's $h_*$ once at job start; validation then costs only the head MLPs. A2's per-layer taps are too large to cache and are recomputed.
 
@@ -426,3 +431,46 @@ done; done
 | (cond.) | B's winner with Muon on the fork's 2-D matrices, only if B wins (design, Training §2) | `train_B.sh` with `--fork_muon True` |
 
 Selection (per head within A1/A2, whole configuration in B, arm by mixed score, then best seed) follows design Training §3–4 and reads the **validation** metrics of §7.5. After selection, iLTMv2 runs on every Phase 0 test (proposal §4.10), through the same forward route.
+
+### 9.1 Selected checkpoints (A1, A2)
+
+Selection rule of design Training §3–4, per arm and per head: the LR with the lowest **seed-mean** pooled validation MSE (`val/mse_<h>/all`, the best-per-head checkpoint of each of the 3 seeds), then that LR's best seed. In both arms and for both heads the winner is **LR 1e-3**, and every selected checkpoint is the end of stage 3 (global step 55,000). LR 1e-3 is the top of the swept grid {1e-4, 3e-4, 1e-3}, so the optimum may lie above it.
+
+| Arm | Head | Pair, seed | Checkpoint | val MSE | val skill (all / iid / hole / extrapolation / duplicate) |
+|---|---|---|---|---|---|
+| A1 | $\hat A$ | `A1_lr1e-3`, seed 1 | `runs/A_seed1/stage3/best/A1_lr1e-3_A.pt` | 0.004041 | 0.891 / 0.910 / 0.872 / 0.825 / 0.916 |
+| A1 | $\hat E_{\text{dir}}$ | `A1_lr1e-3`, seed 0 | `runs/A_seed0/stage3/best/A1_lr1e-3_E.pt` | 0.02117 | 0.420 / 0.370 / 0.447 / 0.474 / 0.496 |
+| A2 | $\hat A$ | `A2_lr1e-3`, seed 1 | `runs/A_seed1/stage3/best/A2_lr1e-3_A.pt` | 0.003812 | 0.898 / 0.917 / 0.880 / 0.829 / 0.922 |
+| A2 | $\hat E_{\text{dir}}$ | `A2_lr1e-3`, seed 1 | `runs/A_seed1/stage3/best/A2_lr1e-3_E.pt` | 0.02108 | 0.423 / 0.375 / 0.443 / 0.476 / 0.526 |
+
+Paths are under `/private/groups/ioannidislab/UQ_decoupling_exp/`. Seed-mean val MSE at LR 1e-3: A1 $\hat A$ 0.004072, $\hat E$ 0.02122; A2 $\hat A$ 0.003837, $\hat E$ 0.02112. Skill is against the constant baseline (§8.1); the e(q) proxy's pooled skills are 0.61 ($\hat t_A$) and 0.12 ($\hat t_E$). These pairs are `iltm2.inference.BEST`: `ILTMv2Regressor.from_best("A1" | "A2")` loads them, and Phase 0 uses them (`experiment0_baseline/configs/methods.yaml`: `iltmv2` = A2, `iltmv2_a1` = A1). The B round is in §9.2.
+
+### 9.2 Selected B configuration (seed 0, provisional)
+
+Arm B ran its 9 configurations (head LR × fork LR) on seed 0 only (design Training §4, round 1). In B the heads share the fork, so a configuration is chosen as a whole: here one configuration is best on $\hat E_{\text{dir}}$ outright and, among the finished runs, on $\hat A$ too, so no tie-break between the heads is needed.
+
+| Configuration | Head | Checkpoint | val MSE | val skill (all / iid / hole / extrapolation / duplicate) |
+|---|---|---|---|---|
+| head LR 3e-4, fork LR 3e-5 | $\hat A$ | `runs/B_h3e-4_f3e-5_seed0/stage3/best/B_A.pt` | 0.003678 | 0.902 / 0.922 / 0.886 / 0.829 / 0.924 |
+| head LR 3e-4, fork LR 3e-5 | $\hat E_{\text{dir}}$ | `runs/B_h3e-4_f3e-5_seed0/stage3/best/B_E.pt` | 0.02058 | 0.436 / 0.384 / 0.472 / 0.487 / 0.513 |
+
+- Both best checkpoints are the end of stage 3 (global step 55,000), so the two files hold the same state (fork + both heads); paths under `/private/groups/ioannidislab/UQ_decoupling_exp/`.
+- **Provisional:** the three head-LR 1e-3 runs had not finished stage 3 at selection time. One of them (fork LR 3e-5) had a slightly lower $\hat A$ MSE at the end of stage 2 (0.003661) but a higher $\hat E_{\text{dir}}$ MSE (0.02077); re-check once they finish. If a configuration then wins one head and loses the other, a criterion for ranking a whole B configuration is needed (the design's mixed score is reserved for comparing arms).
+- Fork LR 3e-5 is the top of the fork grid {3e-6, 1e-5, 3e-5}, as head LR 1e-3 was for A1/A2.
+- Against A2's selected heads (§9.1), B lowers the pooled val MSE by about 3.5% for $\hat A$ (0.003678 vs 0.003812) and 2.3% for $\hat E_{\text{dir}}$ (0.02058 vs 0.02108), on one seed against A2's best of three.
+- `ILTMv2Regressor.from_best("B")` loads it (`iltm2.inference.BEST`); Phase 0 runs it as `iltmv2_b` (`experiment0_baseline/configs/methods.yaml`).
+
+### 9.3 Exporting the runs for analysis
+
+`scripts/05_export_runs.sh` (CPU) pulls the runs' key metrics from the wandb API and the run folders into small CSVs plus a data dictionary (`README.md`) in `/private/groups/ioannidislab/UQ_decoupling_exp/audits/export/`. Runs: `A_seed*` and every `B_*` (finished or running); not the smoke run. Every CSV is long format, one measurement per row, keyed by `run, pair, arm, head_lr, fork_lr, seed`:
+
+| File | One row per | Metrics |
+|---|---|---|
+| `val.csv` | validation step × head × slice | mse, xmse, skill, mean prediction; head A also Â/e(q) and t_A/e(q) |
+| `train.csv` | 250-step window | xmse_A_ema, xmse_E_ema; mean / max gradient norm per head (B: also the fork's, and its distance from init); mini-bank xMSE |
+| `reference.csv` | head × slice | count, mean target, noise floor, constant-baseline MSE / xMSE, e(q)-proxy MSE / xMSE / skill |
+| `runs.csv` | run × pair | status, best val MSE per head (stage, step), whether selected (§9.1–9.2), per-stage wall time, step time, validation time, peak GPU memory, rejection rate |
+| `alphas.csv` | A2 pair × stage end × head × layer | softmax layer weight α_l |
+
+Slices: all, the four query types and the five context-size bins.
+

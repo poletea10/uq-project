@@ -71,8 +71,20 @@ Step 8 (A trainer): done, smoke run passed (`04_smoke_A`: ALL OK; overfit gate =
 
 Step 9 (B trainer): code written, not run. `src/iltm2/train/fork.py` (`ForkTrainer` on `BaseTrainer`): frozen backbone with fork_k = 2 (no taps), `Fork` (copy of blocks 11-12 + LN) feeding one `HeadPair` named "B" (all B runs share wandb keys `B/...`); two AdamW optimizers + tabicl schedules (heads end 1e-7, fork end 1e-8); gradient checkpointing in the fork above 20K rows; clipping fork + heads jointly (`--clip_per joint`, design §6; `separate` optional); best-A / best-E checkpoints store the whole model (fork + both heads); mini-bank caches the fork input. No B smoke job (user's decision): at a fresh stage 1 each job runs `preflight` (one fork forward/backward at N = 60,000, peak memory) and `check_first_batch` (fork output = h_star within 1e-5), printing OK lines; failures stop the job. `scripts/train_B.sh <head_lr> <fork_lr> <seed>` runs stages 1 -> 2 -> 3 in one 4-day job; run name `B_h<H>_f<F>_seed<S>`. Round 1 = the 9 configurations on seed 0 (protocol §9 loop).
 
+A1/A2 results and selection (protocol §9.1): rounds done (A seeds 0-2; B 9 configurations on seed 0 nearly done). Selected per head (seed-mean val MSE, then best seed): LR 1e-3 everywhere, end of stage 3, under /private/groups/ioannidislab/UQ_decoupling_exp/runs/:
+- A1: Â `A_seed1/stage3/best/A1_lr1e-3_A.pt` (val MSE 0.004041, skill 0.891), Ê `A_seed0/stage3/best/A1_lr1e-3_E.pt` (0.02117, skill 0.420; hole 0.447, extrapolation 0.474).
+- A2: Â `A_seed1/stage3/best/A2_lr1e-3_A.pt` (0.003812, skill 0.898), Ê `A_seed1/stage3/best/A2_lr1e-3_E.pt` (0.02108, skill 0.423; hole 0.443, extrapolation 0.476).
+- LR 1e-3 is the grid's top edge: the optimum may lie above it.
+
+B selection (protocol §9.2, seed 0, provisional until the three head-LR 1e-3 runs finish stage 3): head LR 3e-4, fork LR 3e-5, `B_h3e-4_f3e-5_seed0/stage3/best/B_A.pt` / `B_E.pt` (same end-of-stage-3 state): val MSE Â 0.003678 (skill 0.902), Ê 0.02058 (skill 0.436; hole 0.472, extrapolation 0.487). Best Ê of all 9 and best Â of the finished runs; fork LR 3e-5 is the grid's top edge.
+
+Inference: `src/iltm2/inference.py`, `ILTMv2Regressor(checkpoint_A, checkpoint_E=None, pair=None)` (fit / predict / predict_uncertainty -> quantiles, median, mean, A, E, e_q in raw y units), any arm (A1/A2 best files, B best files, stage files + pair); `ILTMv2Regressor.from_best("A1"|"A2"|"B")` = the selected checkpoints (`BEST`). Context-only scaling of X and y as in the prior (clamp at mean +- 4 std, standardize); raw training-mode route, the fork included (protocol §1.3 "Forward route"). Phase 0 adapter: `experiment0_baseline/src/adapters/iltmv2.py` (methods `iltmv2` = A2, `iltmv2_a1` = A1, `iltmv2_b` = B).
+
+Export for analysis: `scripts/05_export_runs.sh` -> `UQ_decoupling_exp/audits/export/` (val, train, reference, runs, alphas CSVs + README data dictionary; protocol §9.3).
+
 ## Waiting on
 
+- Re-check the B selection once `B_h1e-3_*` finish stage 3 (protocol §9.2).
 - The user's launch of the 9 B jobs (seed 0; protocol §9), then their stage-1 summary.json for B's measured step time and memory.
 - The user's rerun of `sbatch experiment1_uq_heads/scripts/00d_test_backbone.sh` (padded-group check).
 - The user's launch of the A jobs (seeds 0, 1, 2; protocol §9), then reading bank-vs-stream consistency in A_seed0 (protocol §6 run 4).

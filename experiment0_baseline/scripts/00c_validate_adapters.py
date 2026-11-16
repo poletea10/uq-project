@@ -16,7 +16,7 @@ from scipy.special import ndtr
 
 import config
 import entropy as en
-from adapters import hgp, tabiclv2
+from adapters import hgp, iltmv2, tabiclv2
 from forecasts import GaussianMixtureForecast, GridOnly, QuantileForecast
 
 FAILS = []
@@ -182,8 +182,26 @@ def test_tabiclv2():
           f"(rel {rel_err(E_got, E_ref):.1e})")
 
 
+def test_iltmv2():
+    """Conversion only (no model): the heads' outputs are passed through, q_m follows the TabICLv2 convention."""
+    K = 999
+    alphas = tabiclv2.quantile_levels(K)
+    qs = np.stack([stats.norm.ppf(alphas, 1.0, 2.0), stats.norm.ppf(alphas, -3.0, 0.1),
+                   stats.t.ppf(alphas, 3, -1.0, 0.5)])
+    A, E, e_q = np.array([0.4, 0.02, 0.1]), np.array([0.3, 0.05, 0.2]), np.array([1.1, 0.06, 0.4])
+    out = iltmv2.to_output(qs, A, E, e_q)
+    ref = tabiclv2.to_output(qs)
+    check("iltmv2 A_hat and E_hat are the heads' outputs, unchanged", np.array_equal(out.A_hat, A)
+          and np.array_equal(out.E_hat, E))
+    check("iltmv2 q_m and e_total follow the TabICLv2 convention (same quantiles -> same CDF and entropy)",
+          np.allclose(out.e_total, ref.e_total, rtol=1e-14) and np.allclose(out.cdf.cdf(qs), ref.cdf.cdf(qs)))
+    check("iltmv2 extras: amortization gap e(q) - A_hat", np.allclose(out.extras["amortization_gap"], e_q - A))
+    shuffled = iltmv2.to_output(qs[:, RNG.permutation(K)], A, E)
+    check("iltmv2 sorts unsorted quantile rows", np.allclose(shuffled.e_total, out.e_total, rtol=1e-12))
+
+
 def main():
-    for name, fn in [("kernel", test_kernel), ("hgp", test_hgp), ("tabiclv2", test_tabiclv2)]:
+    for name, fn in [("kernel", test_kernel), ("hgp", test_hgp), ("tabiclv2", test_tabiclv2), ("iltmv2", test_iltmv2)]:
         print(f"--- {name}", flush=True)
         fn()
     print("ALL OK" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")

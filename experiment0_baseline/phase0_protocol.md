@@ -160,7 +160,7 @@ So a GP's latent s.d. is proportional to the CRPS epistemic term only in the det
 |---|---|---|
 | Heteroscedastic GP | ✓ | Adapter §5.2 (recycled, already validated). Priors deliberately not matched to $f$ |
 | Dec-ICL | ✓ when the checkpoint arrives | Adapter §5.3. Its training prior (explicit $f$ plus Gaussian noise) is close to this toy, so T1 is, if anything, tilted *towards* Dec-ICL; T2 is tilted towards iLTMv2. State both |
-| iLTMv2 | row reserved for Phase 1 | Adapter §5.5 |
+| iLTMv2 | ✓ | Adapter §5.5: Phase 1's selected A2 checkpoints (method `iltmv2`, the paper figure's column); A1's as `iltmv2_a1`, B's as `iltmv2_b` |
 | TabICLv2 | backbone check only (§2.7) | Total only |
 
 ### 2.6 Figures
@@ -402,7 +402,7 @@ Always fill `extras`: when a figure looks wrong you will want the native numbers
 | Dec-ICL | ✓ | ✓ | ✓ | ✓ if checkpoint, else reported numbers |
 | Tuned-ICL | — | — | — | ✓ if checkpoint, else reported numbers |
 | TabICLv2 | backbone check (§2.7) | — | — | ✓ |
-| iLTMv2 | row reserved | row reserved | row reserved | row reserved |
+| iLTMv2 | ✓ (§5.5) | adapter ready | adapter ready | adapter ready |
 | Random (TabICLv2 predictor) | — | — | — | ✓ |
 
 ### 5.2 Heteroscedastic GP (PyMC) — recycled
@@ -457,7 +457,14 @@ Total only. `e_total` and `cdf` come from the 999 raw quantiles at levels $k/100
 
 ### 5.5 iLTMv2
 
-Row reserved for Phase 1. $\hat A$ from the aleatoric head and $\hat E=\hat E_{\text{dir}}$ from the epistemic head (proposal §4.4); `e_total` and `cdf` from the quantile head. Also log $e(q_\theta)-\hat A$ in `extras`, which is the amortization gap of proposal §4.7.
+$\hat A$ from the aleatoric head and $\hat E=\hat E_{\text{dir}}$ from the epistemic head (proposal §4.4); `e_total` and `cdf` from the quantile head. Also log $e(q_\theta)-\hat A$ in `extras`, which is the amortization gap of proposal §4.7.
+
+**Implementation** (`src/adapters/iltmv2.py`). The model is `iltm2.inference.ILTMv2Regressor` (experiment1): `fit` on the context, `predict_uncertainty` on the queries, which returns the 999 raw quantiles, $\hat A$, $\hat E_{\text{dir}}$ and $e(q_\theta)$ in $y$ units.
+- **Forward route.** Phase 1's raw training-mode forward of the frozen TabICLv2 (phase1_protocol.md §1.3), the route the heads were trained on, not `TabICLRegressor`. X and y are scaled as the training prior scaled them, with constants from the context only (robust clamp at mean ± 4 std, then standardization); quantiles map back affinely, and $\hat A$, $\hat E$, $e(q_\theta)$ scale with the context's y std.
+- **Conversion.** $\hat A$ and $\hat E$ are passed through unchanged: the heads predict them, so there is no member family to project. $q_m$ is the CDF piecewise-linear through the 999 quantiles, the convention of §5.4, and `e_total` is its exact entropy.
+- **`e_total` is computed, never assembled.** It is $e(q_m)=\int F_m(1-F_m)$ of the forecast itself, integrated exactly from its quantiles, never $\hat A+\hat E$. The two heads are trained separately and nothing ties their sum to $e(q_m)$, so in the figures (row 2: $e(q_m)$ black, $\hat A$ red) $\hat A$ tracking $e(q_m)$ wherever the context is dense, and falling below it only where epistemic uncertainty rises, is a learned behaviour of the aleatoric head, not a construction. For the same reason $e(q_m)-\hat A$ is close to $\hat E$ but not identical to it: $\hat A+\hat E$ estimates the forecast's expected score $A+E(q_m)$, which equals $e(q_m)$ only when $q_m$ is the exact Bayes predictive (the CRPS divergence is symmetric). $e(q_m)-\hat A$ itself is logged in `extras` as the amortization gap (proposal §4.7). `extras` holds the quantiles, both heads' outputs, $e(q_\theta)$, the amortization gap, the y scale and the checkpoints. Unit test: `00c` (conversion only).
+- **Which checkpoints** (`configs/methods.yaml`). `iltmv2`: arm A2's checkpoints selected on Phase 1's validation bank (phase1_protocol.md §9.1); `iltmv2_a1`: arm A1's; `iltmv2_b`: arm B's selected configuration (fork + both heads, §9.2). `checkpoint_A` / `checkpoint_E` / `pair` select any other checkpoint, of any arm (A1, A2, B).
+- **Not the same forecast as the TabICLv2 row.** The TabICLv2 adapter (§5.4, backbone check) runs `TabICLRegressor` with its preprocessing and ensemble, so its $q_m$ differs from iLTMv2's. Compare their forecasts only through this route.
 
 ---
 

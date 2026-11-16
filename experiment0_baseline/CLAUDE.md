@@ -37,13 +37,15 @@ The heteroscedastic GP adapter (DTC sparse GP, protocol §5.2), the entropy kern
 ## Where things live (T1 and backbone check)
 
 - `src/toy.py` — curated $f$, $\sigma_k(x)$, context sampler, `ToyTask`; `src/evaluate.py` — `run_toy` (fit, truth, quantiles, one parquet per (method, rung, $n$) in `outputs/raw/toy/<method>/`).
-- `src/adapters/` — `hgp.py`, `tabiclv2.py`, `base.py` (`UQOutput`, `gaussian_members`).
+- `src/adapters/` — `hgp.py`, `tabiclv2.py`, `iltmv2.py` (Phase 1's `iltm2.inference.ILTMv2Regressor`; methods `iltmv2` = A2 checkpoints, `iltmv2_a1` = A1, `iltmv2_b` = B, `configs/methods.yaml`), `base.py` (`UQOutput`, `gaussian_members`).
 - Run order: `00_curate_toy` → `00b_validate_estimators`, `00c_validate_adapters` → `01_toy --method hgp` → `00a_backbone_check` (criterion 1 reads the GP's outputs). Figures land in `outputs/figures/toy/`, tables in `outputs/tables/`. `01_toy --paper-figure` draws the 3×3 paper figure from saved outputs only.
 - `run_toy` reuses any existing parquet: after changing a toy or method constant, move the old outputs to a `v<k>/` subfolder inside `outputs/archive` or pass `--overwrite`.
 
 ## Current task
 
 T1 code written (protocol §11 items 1–5). Current toy set: `gap_density` 0.075, heteroscedastic GP with a learned log-noise mean $m_g$ (§5.2); the previous run (density 0.025, zero-mean $g$) is in the `archive/v1/` output folder. Next: rerun `00c`, `00_curate_toy` (re-checks the frozen seed, redraws the toy figure), `01_toy --method hgp`, then `00a_backbone_check`; the backbone check is the decision point between the hand-built $f$ and the fallback draw from our own prior (§2.7). Then item 6, the Dec-ICL adapter.
+
+iLTMv2 on T1 (user's request): adapter `src/adapters/iltmv2.py` (§5.5) with Phase 1's selected checkpoints, registered as `iltmv2` (A2, the paper figure's column), `iltmv2_a1` (A1) and `iltmv2_b` (B) in `evaluate.py`; conversion test in `00c`. Run: `sbatch experiment0_baseline/scripts/01_toy.sh --method iltmv2 --paper-figure --allow-missing` (all rungs, per-rung figures, paper figure with Dec-ICL pending), then `--method iltmv2_a1` and `--method iltmv2_b`. CPU is enough. `e_total` is the forecast's own e(q), never Â + Ê (protocol §5.5). Rerun `00c` first.
 
 ## Waiting on
 
