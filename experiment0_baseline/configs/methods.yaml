@@ -13,12 +13,11 @@ tabiclv2:
   checkpoint: /private/groups/ioannidislab/ajaras/tabicl-dev/tabicl-regressor-v2-20260212.ckpt
 
 iltmv2:                     # Phase 1 model (§5.5): the paper figure's iLTMv2 column
-  arm: A2                   # that arm's checkpoints selected on the validation bank (iltm2.inference.BEST,
-                            # phase1_protocol.md §9); or give checkpoint_A [checkpoint_E, pair] for any other
-                            # checkpoint of any arm (A1, A2, B). After changing it, rerun with --overwrite.
-
-iltmv2_a1:                  # the same model with the A1 arm's selected checkpoints (per-rung figures only)
-  arm: A1
+  arm: A                    # that arm's selected checkpoints (iltm2.inference.BEST; legacy: true takes the first
+  legacy: true              # round's, LEGACY_BEST, until the current round's selection exists); or give checkpoint_A
+                            # [checkpoint_E, pair] for any other checkpoint of either arm (A, B). After changing it,
+                            # rerun with --overwrite.
 
 iltmv2_b:                   # the same model with arm B's selected checkpoint (fork + both heads; per-rung figures only)
   arm: B
+  legacy: true

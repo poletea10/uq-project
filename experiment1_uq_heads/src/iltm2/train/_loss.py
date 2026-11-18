@@ -1,13 +1,18 @@
-"""The heads' loss (phase1_design.md Architecture §3) and the per-batch targets it is computed against.
+"""The heads' loss (phase1_design.md Architecture §3; transfer guide §3.6) and the per-batch targets it is computed
+against.
 
     L = mean_q[ w (Â - t_A)^2 ] + lambda_E mean_q[ w (Ê_dir - t_E)^2 ],     w = (sg[e(q_theta)] + c)^(-p)
 
     - mean_q is the average over the query rows passed in. A step made of several micro-batch groups of different
-      sizes m weights each group by its share of the step's query rows (`group_weight`), so the step's loss is the
-      average over all its query rows, whatever the grouping.
-    - p = 0 (the default of every run) gives w = 1 exactly: plain unweighted MSE. p = 2 (inverse-variance weighting,
-      with the floor c, e.g. the 5th percentile of e(q) over the prior) is a fallback ablation only. The weight
-      depends on (x_*, D) only, through the frozen e(q), so it never moves the minimiser (design §3).
+      sizes m (and, in stage 1, of two passes per group: full and subsampled context) weights each group-pass by its
+      share of the step's query rows (`group_weight`), so the step's loss is the average over all its query rows,
+      whatever the grouping.
+    - p is set per head pair, p in {0, 1}. p = 0 gives w = 1 exactly: plain unweighted MSE, where large-value queries
+      dominate. p = 1 up-weights low-spread queries by 1/e(q_theta), giving back the factor of the output's scale by
+      which softplus weakens the gradient on small values. The floor c caps the largest weight at 1/c; it is fixed
+      at 0.1 (`iltm2.prior._bank.LOSS_C`, recorded in the bank's manifest["loss_c"]), so queries with e(q) well
+      below 0.1 (mostly deterministic tasks) share roughly the same weight, at most about 6x a typical noisy query's.
+      The weight depends on (x_*, D) only, through the frozen e(q), so it never moves the minimiser.
     - The heads share no parameter, so lambda_E only rescales the Ê head's gradient (default 1).
     - Targets are the raw unbiased estimates (`iltm2.train._targets`): never clipped at 0.
 
@@ -49,7 +54,7 @@ def loss_weight(e_q: Tensor, p: float = 0.0, c: Optional[float] = None) -> Tenso
     """w = (sg[e(q)] + c)^(-p); exactly 1 for p = 0. e(q) is detached: no gradient ever flows into the PPD."""
     if p == 0:
         return torch.ones_like(e_q)
-    assert c is not None and c > 0, "p > 0 needs a positive floor c (design §3)"
+    assert c is not None and c > 0, "p > 0 needs a positive floor c (the bank's manifest['loss_c'])"
     return (e_q.detach() + c).pow(-p)
 
 

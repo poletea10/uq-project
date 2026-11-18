@@ -1,66 +1,64 @@
 # Phase 0 — Setting the baseline: execution protocol
 
-Phase 0 has four tests and trains nothing. iLTMv2 rows stay visibly empty until Phase 1 delivers the model.
+Phase 0 has six tests and trains nothing. The iLTMv2 rows use Phase 1's selected checkpoints (§5.5).
 
 | # | Test | Question | Ground truth | Models | Output |
 |---|---|---|---|---|---|
 | T1 | **Toy set** (toy rungs 0–2) | *Where* does each model put $\hat A$ and $\hat E$ on one curated 1-D function? | Closed form | Heteroscedastic GP, Dec-ICL, iLTMv2 | One 3×4 context figure per (model, toy rung): 9 figures, plus one 3×3 paper figure |
-| T2 | **Cut-graph test** (in distribution) | Are $\hat A$ and $\hat E$ numerically right on the prior iLTMv2 is trained on, including in context holes? | Exact replicates (observed cut) | Dec-ICL, iLTMv2 | Reliability plots + table |
-| T3 | **Transfer test** | Do they stay right on the unmodified, fully confounded `graph_scm`? | Exact-match replicates on low-cardinality categorical features | Dec-ICL, iLTMv2 | Reliability plots + table |
-| T4 | **Active learning** | Does the epistemic estimate select useful data? | Test-set performance | Random, TabICLv2, iLTMv2, Tuned-ICL, Dec-ICL | Table + learning curves |
+| T2 | **Error heatmap** | Are $\hat A$ and $\hat E$ right across local data density and local noise? | Closed form | Heteroscedastic GP, Dec-ICL, iLTMv2 | One heatmap figure |
+| T3 | **PRR-A** (total error) | Do $\hat A+\hat E$ rank the forecast's loss better than its own spread? | Realized CRPS | iLTMv2 (Dec-ICL if available) | Curves + table |
+| T4 | **PRR-B** (reducible error) | Does $\hat E$ say which predictions would improve with more data? | Realized CRPS gain | iLTMv2 (Dec-ICL if available) | Curves + table |
+| T5 | **Active learning** | Does the epistemic estimate select useful data? | Test-set performance | Random, TabICLv2, iLTMv2, Tuned-ICL, Dec-ICL | Table + learning curves |
+| T6 | **Context retrieval** | Does $\hat E$-guided retrieval beat k-NN for a given query? | Realized CRPS | iLTMv2 | Curves + table |
 
-T1 is for the paper's main figure: easy to read, no metric table. T2 and T3 carry the numbers. T4 is the usefulness check and the first preview of Phase 2.
-
-> **Changes from the previous protocol, for anyone reading old code** (previous version: `/private/home/ajaras/iLTM-bio/UQ_project/SCRAPPED/v2/experiment0_baseline`).
-> - Rungs 0–3 over a *distribution* of low-rank GP functions are replaced by the toy set: **one curated function**, three noise settings, shown as figures rather than graded with metrics. The old seed-averaged reliability scheme survives only as an optional appendix figure (§2.8).
-> - Old rung 4 becomes the **cut-graph test** (T2), now with **context-hole queries**.
-> - New: the **transfer test** (T3), previously an open item ("rung 5").
-> - Baselines reduced to the **heteroscedastic GP** (toy set only) and **Dec-ICL** (Bergna et al., 2026). CatBoost, UD4PFN and DER are dropped, along with their adapters.
-> - Tuned-ICL and Dec-ICL are **run** in active learning if the authors share the checkpoints; otherwise their reported numbers are used as context.
-> - The TabICLv2 motivating figure is folded into the **backbone check** (§2.7).
+T1 and T2 are the visual results: T1 gives the paper's main figure (easy to read, no metric table), and T2 extends its two situations to a whole grid of local density and local noise. T3–T6 are the thorough evaluation on real data. T3 and T4 ask whether the estimates rank the right errors; T5 and T6 ask whether $\hat E$ selects useful data. T6 is the first preview of Phase 2.
 
 ---
 
 ## 1. Layout, environments and shared constants
 
 ```
-experiment0_baselines/
+experiment0_baseline/
 ├── CLAUDE.md
-├── configs/            # protocol.yaml, toy_function.yaml, toy_rung{0,1,2}.yaml,
-│                       # cutgraph.yaml, transfer.yaml, al.yaml
+├── configs/            # protocol.yaml, toy_function.yaml, toy_rung{0,1,2}.yaml, methods.yaml,
+│                       # heatmap.yaml (T2), al.yaml (datasets and splits, T3–T6; loop, T5), retrieval.yaml (T6)
 ├── src/
-│   ├── toy.py          # the curated function f, noise settings, context sampler
-│   ├── truth.py        # realized A and E: closed form (T1), replicate-based (T2, T3)
+│   ├── config.py       # YAML loaders and output paths
+│   ├── toy.py          # the curated function f, noise settings, context sampler (T1)
+│   ├── heatmap.py      # T2 probe-strip toys: background, strip, cells, shared draws
+│   ├── truth.py        # realized A and E(q_m) in closed form (T1, T2); realized CRPS at an observed y (T3–T6)
 │   ├── entropy.py      # e_CRPS kernel, excess kernel, shared t-grid builder
+│   ├── forecasts.py    # forecast objects q_m (Gaussian mixture, quantile CDF): entropy, excess, CRPS
 │   ├── adapters/       # base.py (UQOutput), hgp.py, decicl.py, tabiclv2.py, iltmv2.py
-│   ├── cutgraph.py     # T2 tasks, pools, context holes, replicates
-│   ├── transfer.py     # T3 tasks, categorical pools, held-out cells, exact-match replicates
-│   ├── grading.py      # truth-on-estimate OLS, bootstrap, reliability plots (T2, T3)
-│   ├── figures.py      # 3×4 context figures (T1, backbone check), 3×3 paper figure (T1)
-│   └── active_learning.py
+│   ├── evaluate.py     # method registry; per-(rung, n) evaluation of T1
+│   ├── datasets.py     # the five real datasets and their stored splits (T3–T6)
+│   ├── prr.py          # rejection curves and PRR (T3, T4)
+│   ├── active_learning.py   # T5 loop and metrics
+│   ├── retrieval.py    # T6 selection rules (random, k-NN, greedy with shortlist)
+│   └── figures.py      # 3×4 context figures (T1, backbone check), 3×3 paper figure (T1), heatmap (T2),
+│                       # rejection curves (T3, T4), learning and budget curves (T5, T6)
 ├── scripts/            # 00_curate_toy, 00a_backbone_check, 00b_validate_estimators, 00c_validate_adapters,
-│                       # 01_toy (--method, --paper-figure), 02_cutgraph (--method), 03_transfer (--method),
-│                       # 04_active_learning (--method --dataset)
-└── outputs/{raw,figures,tables}/
+│                       # 01_toy (--method, --paper-figure), 02_heatmap (--method), 03_prr_a (--method --dataset),
+│                       # 04_prr_b (--method --dataset), 05_active_learning (--method --dataset),
+│                       # 06_retrieval (--method --dataset; --resolution-check)
+└── outputs/{raw,figures,tables,logs}/
 ```
 
 **Environments.**
 
-- `uq-iltm-bio` for everything by default, including the heteroscedastic GP (PyMC with the numpyro backend).
+- `uq-iltm-bio` for everything by default, including the heteroscedastic GP (PyMC with the numpyro backend) and iLTMv2, which runs through Phase 1's editable-installed `iltm2` package.
 - Dec-ICL gets whatever environment its checkpoint needs, with the same parquet hand-off if it clashes with `uq-iltm-bio`. Never import a clashing env in-process.
-
-**Recyclable code.** The previous version already has a working heteroscedastic GP adapter, the 3×4 context figures, the entropy kernels, the low-rank GP generator with its rung YAMLs, and the reliability-plot evaluator. Reuse them where this protocol agrees with them; where it does not, this protocol wins.
 
 **Shared constants** (`protocol.yaml`, fixed before the first run, never tuned):
 
 | Constant | Value |
 |---|---|
-| `n_grid` | 16, 64, 256, 1024 (context sizes; T1, T2, T3) |
+| `n_grid` | 64, 256, 1024, 4096 (context sizes; T1 and the backbone check) |
 | `S` | 500 posterior samples (heteroscedastic GP) |
-| `R_rep` | 100 replicate draws of $y$ per query (T2); cap on replicates per query (T3) |
-| `n_bins` | 20 equal-count bins for reliability plots (T2, T3) |
-| `sigma_floor` | $10^{-6}$. Clip value for every predicted σ (§10, gotcha 3); $\sigma_{\text{floor}}/\sqrt\pi$ is the display floor of log-scale plots |
-| `base_seed` | 0. Root of every RNG stream (§9) |
+| `sigma_floor` | $10^{-6}$. Clip value for every predicted σ (§12, gotcha 3); $\sigma_{\text{floor}}/\sqrt\pi$ is the display floor of log-scale plots |
+| `base_seed` | 0. Root of every RNG stream (§11) |
+
+**One recorded deviation: `n_grid`.** `n_grid` is the one constant set after a first run. It was $\{16,64,256,1024\}$ when iLTMv2's toy figures were first drawn; it is now $\{64,256,1024,4096\}$. The reason does not depend on which model wins: the smallest context Phase 1 trains on is 64 rows, so $n=16$ is outside every head's training range, and $n=4096$ adds a column where the sparse strip holds about 128 points. The context is drawn once at $n=4096$ and nested; its first 1,024 points equal the earlier draw at $n=1024$ (asserted), so the columns $n\le1024$ do not change. The choice was nevertheless made after seeing iLTMv2's figures, and it is stated here as a deviation from the "fixed before the first run" rule.
 
 ---
 
@@ -70,7 +68,7 @@ experiment0_baselines/
 
 One fixed 1-D function, one fixed context draw, three noise settings. Each model gets one figure per setting, showing along $x$ where it puts aleatoric and epistemic uncertainty against the exact truth. It follows the spirit of the toy figures in DEUP (Lahlou et al., 2023, Fig. 1 and App. E) and DecoupledPFN (Bergna et al., 2026, Fig. 1), but uses the context-figure layout of §2.6 rather than DEUP's shaded panels.
 
-It is an illustration, not a grade: a single function cannot support calibration claims. The quantitative grading lives in T2 and T3.
+It is an illustration, not a grade: a single function cannot support calibration claims. T2 turns the same picture into numbers over many toy functions, and T3–T6 carry the evaluation on real data.
 
 ### 2.2 The curated function
 
@@ -80,7 +78,7 @@ $$
 y=f(x)+\sigma(x)\,\varepsilon,\qquad \varepsilon\sim\mathcal N(0,1),\qquad f(x)=f_{\text{base}}(x)+f_{\text{gap}}(x).
 $$
 
-**Base part.** The low-rank GP of the previous protocol (Rasmussen & Williams, 2006; Kang, 2021):
+**Base part.** A low-rank GP (Rasmussen & Williams, 2006; Kang, 2021):
 
 $$
 f_{\text{base}}(x)=\sum_{j=1}^{J}\theta_j\,b_j(x),\qquad b_j(x)=\exp\!\Big(-\frac{(x-c_j)^2}{2\ell^2}\Big),\qquad \theta\sim\mathcal N(0,s_\theta^2 I_J).
@@ -131,7 +129,7 @@ All three use the **same $f$, the same context $x$-positions and the same standa
 
 Fixed constants (`toy_rung{k}.yaml`):
 
-- $\sigma_0=e^{-0.7-\log 2}\approx0.25$, the median ordinary noise of the old rung 3;
+- $\sigma_0=e^{-0.7-\log 2}\approx0.25$;
 - $\phi_b=\log 6$, so the noise strip has $\sigma\approx1.5$;
 - noise strip $[-3.5,-1.5]$, edge width $w=0.1$.
 
@@ -149,7 +147,7 @@ So a GP's latent s.d. is proportional to the CRPS epistemic term only in the det
 
 ### 2.4 Context and queries
 
-- **Context.** $x$ drawn from a piecewise-uniform density on `x_range`: relative density 1 outside $[1,4]$ and `gap_density` $=0.075$ inside. Drawn once at $n=1024$ from the context stream of §9; each $n\in$ `n_grid` uses the first $n$ points (nested contexts). At $n=16$ the gap is expected to be empty; it holds about 2 points at $n=64$, 8 at $n=256$ and 32 at $n=1024$, where it is still about 13 times sparser than its surroundings.
+- **Context.** $x$ drawn from a piecewise-uniform density on `x_range`: relative density 1 outside $[1,4]$ and `gap_density` $=0.075$ inside. Drawn once at $n=4096$ from the context stream of §11; each $n\in$ `n_grid` uses the first $n$ points (nested contexts). The gap holds about 2 points at $n=64$, 8 at $n=256$, 32 at $n=1024$ and 128 at $n=4096$, where it is still about 13 times sparser than its surroundings.
 - **Why this density.** With about 12 points in the gap at $n=1024$, a reviewer could argue that the heteroscedastic GP's "noise" reading of the gap is defensible from the data alone, since 12 scattered points look like noise. With about 32, the wiggles are clearly signal, and "the GP misattributes" becomes unambiguous.
 - **Queries.** `n_query` $=200$ points evenly spaced on `x_range`, shared by all toy rungs and models.
 - **Truth** (§4.1). Closed form and **exact** for this context: $A=\sigma(x_*)/\sqrt\pi$ and $E(q_m)=\int(F_m-\Phi)^2dt$. There is no realized-task noise, since $f$ and $\sigma$ are known.
@@ -158,30 +156,29 @@ So a GP's latent s.d. is proportional to the CRPS epistemic term only in the det
 
 | Model | Runs | Notes |
 |---|---|---|
-| Heteroscedastic GP | ✓ | Adapter §5.2 (recycled, already validated). Priors deliberately not matched to $f$ |
-| Dec-ICL | ✓ when the checkpoint arrives | Adapter §5.3. Its training prior (explicit $f$ plus Gaussian noise) is close to this toy, so T1 is, if anything, tilted *towards* Dec-ICL; T2 is tilted towards iLTMv2. State both |
-| iLTMv2 | ✓ | Adapter §5.5: Phase 1's selected A2 checkpoints (method `iltmv2`, the paper figure's column); A1's as `iltmv2_a1`, B's as `iltmv2_b` |
+| Heteroscedastic GP | ✓ | Adapter §5.2 (validated). Priors deliberately not matched to $f$ |
+| Dec-ICL | ✓ when the checkpoint arrives | Adapter §5.3. Its training prior (explicit $f$ plus Gaussian noise) is close to this toy, so T1 and T2 are, if anything, tilted *towards* Dec-ICL and the GP (§2.9). State it |
+| iLTMv2 | ✓ | Adapter §5.5: Phase 1's selected arm-A checkpoints (method `iltmv2`, the paper figure's column); arm B's as `iltmv2_b` |
 | TabICLv2 | backbone check only (§2.7) | Total only |
 
 ### 2.6 Figures
 
-**One figure per (model, toy rung), 3 rows × 4 columns: 9 figures.** This is the layout of the previous version's context figures; recycle `figures.py`. Columns are $n\in\{16,64,256,1024\}$. Title: `toy rung k: <method>`.
+**One figure per (model, toy rung), 3 rows × 4 columns: 9 figures.** Columns are $n\in\{64,256,1024,4096\}$. Title: `toy rung k: <method>`.
 
 | Row | Content | Axis |
 |---|---|---|
 | 1 | Context points; true mean $f$ with true 90 % band $f\pm1.645\,\sigma$; forecast median with forecast 90 % band (5 %–95 % quantiles of $q_m$) | linear |
-| 2 | Realized $A$ (blue), $\hat A$ (red) and total $e(q_m)$ (black) | linear |
-| 3 | Realized $E(q_m)$ (blue, **this model's own** excess) and $\hat E$ (red) | log, floor $\sigma_{\text{floor}}/\sqrt\pi$; points below it are drawn on the floor |
+| 2 | Realized $A$ (blue), $\hat A$ (red) and total $e(q_m)$ (black, dashed) | linear |
+| 3 | Realized $E(q_m)$ (blue, **this model's own** excess) and the model's predicted excess $\hat E$ (red) | log, floor $\sigma_{\text{floor}}/\sqrt\pi$; points below it are drawn on the floor |
 
-- Shade the noise strip (orange) and the sparse strip (purple) in every panel.
+- Shade the noise strip (orange) and the sparse strip (purple) in every panel. There is no shading between $\hat A$ and $e(q_m)$.
 - Put a rug of the context $x$-positions on rows 2–3.
-- **Within a toy rung, share the y-limits of each row across the three models' figures**, so they can be compared side by side.
-- For toy rung 0, row 2's truth is the zero line. Report each model's σ clip rate in a corner of row 2 (§10, gotcha 3).
-- Row 2 carries $e(q_m)$ so that the split is visible at a glance. For every model whose $\hat E$ is $e_{\text{tot}}-\hat A$ (§4.4), $\hat A\le e(q_m)$, and the vertical gap between the black and red curves *is* $\hat E$.
+- Row 3 carries a small legend naming each model's estimator: **$e(q_m)-\hat A$** for the heteroscedastic GP and Dec-ICL, **the $\hat E_{\text{dir}}$ head** for iLTMv2. $e(q_\theta)-\hat A$ is not shown for iLTMv2 (it is logged in `extras`, §5.5).
+- **Within a toy rung, share the y-limits of each row across the three models' figures**, so they can be compared side by side. The one exception is row 2 of toy rung 0, which gets per-model y-limits (or a log axis), so that $\hat A\approx0$ stays visible next to a model whose $\hat A$ is large.
+- For toy rung 0, row 2's truth is the zero line. Report each model's σ clip rate in a corner of row 2 (§12, gotcha 3).
+- Row 2 carries $e(q_m)$ so that the split is visible at a glance. For every model whose $\hat E$ is $e_{\text{tot}}-\hat A$ (§4.4), $\hat A\le e(q_m)$, and the vertical gap between the dashed black and the red curves *is* $\hat E$. For iLTMv2 it is not: its two heads are trained separately (§5.5).
 
-As reference, you can reuse the code available in `/private/home/ajaras/iLTM-bio/UQ_project/SCRAPPED/v2/experiment0_baseline/src/figures.py`.
-
-**Paper figure.** `01_toy.py --paper-figure` draws one 3×3 figure for toy rung 2 at $n=1024$: one column per model (heteroscedastic GP, Dec-ICL, iLTMv2), with the same three rows as above. It is built from the saved outputs only, once all three models have been run, and shares each row's y-limits across its three columns. It focuses on the one question the paper figure has to answer: with the same context, where does each model put aleatoric and epistemic uncertainty? The per-(model, toy rung) figures stay as the full record across $n$.
+**Paper figure.** `01_toy.py --paper-figure` draws one 3×3 figure for toy rung 2 at $n=1024$: one column per model (heteroscedastic GP, Dec-ICL, iLTMv2), with the same three rows as above. It is built from the saved outputs only, once all three models have been run, and shares each row's y-limits across its three columns. It focuses on the one question the paper figure has to answer: with the same context, where does each model put aleatoric and epistemic uncertainty? The per-(model, toy rung) 3×4 figures go to the appendix, as the full record across $n$.
 
 ### 2.7 Backbone check (run first)
 
@@ -211,60 +208,84 @@ The check fails if criterion 1 fails at any $n$, or if criterion 2 or 3 fails at
 | 1 | $\hat A$ flat at $\sigma_0/\sqrt\pi$; $\hat E$ follows the (smaller) true gap bump | $\hat A$ rises in the gap (gap read as noise) |
 | 2 | $\hat A$ tracks the noise bump only; $\hat E$ higher in the gap than in the noise strip | $\hat A$ smeared across both strips; $\hat E$ highest in the noise strip |
 
-> **Note — optional appendix figure: seed-averaged reliability on the toy generator.** The previous version graded rungs over a *distribution* of low-rank GP functions: new $(\theta,\phi)$ per seed, `n_seeds` $=20$, truth-on-estimate reliability plots of realized $A$ against $\hat A$ and realized $E(q_m)$ against $\hat E$, coloured by $n$ (the grading of §6, applied to the toy generator). It is not a priority, but it would make an interesting appendix figure: it turns the single-function picture of T1 into a calibration statement over the toy family. It is cheap, because the generator, evaluator and reliability-plot code already exist in the previous version. If added, draw $\eta$ per seed as well, so that every function has its harder gap, and run the same three noise settings.
+The realized excess of one function is jagged; a correct $\hat E$ is a smooth curve through it (§4.5). A match in level and shape is the expected good result, not a point-by-point match.
+
+### 2.9 Why the comparison is fair
+
+*The objection.* The baselines' $\hat E$ is $e(q_m)-\hat A$, and $e(q_m)$ is not the forecast's expected score under the true law, $\mathbb E_{Y\sim p_\tau}[S(q_m,Y)]$. So why should $e(q_m)-\hat A$ match the realized excess $E(q_m)=\mathbb E_{Y\sim p_\tau}[S(q_m,Y)]-e(p_\tau)$?
+
+*The answer.* Nobody has the true law at test time, including our head. Every model can only **predict** its excess from $(x_*,D)$. The question is how each one forms that prediction.
+
+1. A Bayesian-style model holds a set of candidate task laws $F_m$ with weights $w_m$ (posterior draws for the GP; latent values convolved with the noise model for Dec-ICL). Its forecast is their mixture, $q_m=\sum_m w_mF_m$.
+2. The model believes the truth is one of its members, $F_m$ with probability $w_m$. If the truth were $F_m$, the excess would be $\mathbb E_{Y\sim F_m}[S(q_m,Y)]-e(F_m)$.
+3. Averaging over its own belief, and using that the expected score is linear in the law of $Y$:
+
+$$
+\sum_m w_m\,\mathbb E_{Y\sim F_m}\big[S(q_m,Y)\big]=\mathbb E_{Y\sim q_m}\big[S(q_m,Y)\big]=e(q_m),
+\qquad\text{so}\qquad
+\sum_m w_m\,d_S(q_m,F_m)=e(q_m)-\hat A .
+$$
+
+So $e(q_m)$ is not the forecast's true expected score: it is **the model's own prediction of it**. Likewise $\hat A$ is the model's prediction of the irreducible floor, and $e(q_m)-\hat A$ is exactly the model's prediction of its excess. It is the standard total-minus-aleatoric decomposition (Hofman et al., 2024); for the log score the same identity gives the mutual information used in BALD (Houlsby et al., 2011; Depeweg et al., 2018).
+
+4. *Same target as our head.* If a model's members are the exact posterior over tasks, the identity reads $e(q)-\mathbb E_{\tau\mid D}[e(p_\tau)]=\mathbb E_{\tau\mid D}[d_S(q,p_\tau)]$. The right-hand side is precisely what $\hat E_{\text{dir}}$ converges to under squared error. So both estimators aim at the same quantity, the expected excess given the context, in the same units, and each is graded against its own model's realized excess.
+5. *What differs.* The baselines derive the prediction from their own posterior; ours is learned from realized excess (DEUP's idea; Lahlou et al., 2023). When a model's posterior is wrong, its self-predicted excess misses the bias. That gap is the result the figure shows; it is not an artefact of the conversion.
+
+*A worked case.* Members $\mathcal N(\mu_m,\sigma^2)$ with $\mu_m\sim\mathcal N(\bar\mu,s^2)$ give $q=\mathcal N(\bar\mu,s^2+\sigma^2)$, $\hat A=\sigma/\sqrt\pi$ and $e(q)-\hat A=(\sqrt{s^2+\sigma^2}-\sigma)/\sqrt\pi$. Drawing the true mean from $\mathcal N(\bar\mu,s^2)$ and averaging the realized divergence gives the same value.
+
+*Limits, stated in the caption or text:*
+
+- The identity holds on average over tasks consistent with the context. One function cannot show calibration, so T1 is an illustration.
+- Dec-ICL's native epistemic signal is the variance of its latent head, with $v_{\text{tot}}=v_{\text{epi}}+\hat\sigma^2$ (Bergna et al., 2026, App. C.1). A variance cannot be drawn against a CRPS truth, so its members $\mathcal N(c_j,\hat\sigma^2)$ are projected as above (§5.3). Its native $v_{\text{epi}}$ is used where only ranking matters (T4, T5).
+- iLTMv2 is the only model trained on exactly this target. That is the method, not a bias of the test. In the other direction, the toy function is closer to the GP's and Dec-ICL's function classes than to iLTMv2's prior.
 
 ---
 
-## 3. T2 — Cut-graph test (in distribution)
+## 3. T2 — Error heatmap
 
-### 3.1 Tasks
+### 3.1 What it shows
 
-Tasks come from the observed-cut prior of Phase 1 (proposal §4.3):
+T1 shows two situations on one function: a noisy region with plenty of data, and a sparse region with little noise. T2 fills in the whole grid. For every combination of local data density and local noise, it shows whether each model's $\hat A$ and $\hat E$ are too high, right, or too low. The two strips of T1 are two cells of this grid.
 
-- $X$ is generated by an $X$-graph with `graph_scm`'s mechanism (no $y$ node).
-- $y=\Psi_\theta(X,U_2)$ comes from a second, `graph_scm`-style target graph whose $X$-input nodes are the $X$-graph's feature-hosting nodes (non-root nodes whose parent value is the observed post-converter columns, so deterministic in $X$), and whose other roots are private noise roots: they are $U_2$, the target graph's only randomness.
-- Redrawing only $U_2$ gives exact i.i.d. replicates of $y$ at fixed $x_*$; one extra pass of the target branch gives a replicate for every row at once.
+### 3.2 Construction: a probe strip
 
-A **task** is everything the generator fixes once: the DAG, the node functions, the target graph and its parameters (cached in `RandomNodeFunction._fit`). A **task seed** redraws only the rows, i.e. a fresh pool of $X$ from $U_1$, and with it a fresh context, hole and query set. This gives two levels of repetition: **across tasks**, and **within a task across seeds**.
+Each toy function has a fixed background and one strip. The cell sets the strip's local density and local noise, and only queries inside the strip are scored. The surroundings of the strip are the same for every cell of a toy, so a cell's value is not confounded by what lies around it.
 
-Provisional constants (`cutgraph.yaml`): `n_tasks` $=50$, `n_task_seeds` $=5$, `n_query` $=200$ (100 hole + 100 ordinary), `hole_frac` $=0.10$.
+| Element | Setting |
+|---|---|
+| Function | The toy generator's base family on $[-5,5]$ (§2.2: 28 bumps, width 0.3, unit prior s.d.), fresh draw per toy, no gap part |
+| Strip | Width 2, position drawn per toy inside $[-4,4]$, edge width 0.1 |
+| Background | Per toy, drawn once and kept for all its cells: context density $d_{\text{bg}}$ log-uniform in [64, 1,024] points per unit of $x$; noise $\sigma_{\text{bg}}$ log-uniform in [0.05, 0.5] |
+| x-axis (cell) | Context points inside the strip: 0, 2, 8, 32, 128, and "background" (the strip at density $d_{\text{bg}}$) |
+| y-axis (cell) | Noise s.d. inside the strip: 0, 0.1, 0.25, 0.6, 1.5 |
+| Queries | 50 evenly spaced points in the strip interior (0.25 away from each edge) |
+| Sharing | Within a toy, all 30 cells share the function, the background context and the standard-normal noise draws |
+| Toys | 20 (the first 10 for the heteroscedastic GP, which needs one NUTS fit per toy and cell) |
 
-Note the following:
+The grid, the distributions and the floor below are fixed before the first run (`heatmap.yaml`) and not tuned afterwards.
 
-- **It favours iLTMv2**, because it is iLTMv2's training prior. It is an in-distribution test for iLTMv2, not a fair comparison.
-- **It depends on the Phase 1 prior.** Build it after T1. It doubles as the first working implementation of the observed cut.
-- **Dec-ICL assumes Gaussian end-node noise** (Bergna et al., 2026), and $y\mid x$ here is non-Gaussian. It is graded as published. Part of any gap is that misspecification, and the thesis says so.
+### 3.3 Truth and cell value
 
-> **Generator settings: see Phase 1.** The target-graph design, its settings and the adapted rejection filter are defined in proposal §4.3 and `experiment1_uq_heads/phase1_design.md` Training §1 and §1.4, and implemented in `experiment1_uq_heads/src/iltm2/prior/` (`_cut_graph_scm.py`, `_filter.py`), which T2 imports as `iltm2.prior`. The final target-graph configuration is the one that passes the difficulty-match gate (`experiment1_uq_heads/scripts/00f_difficulty_match.py`).
+**Truth.** Closed form per query, as in T1 (§4.1): $A=\sigma(x_*)/\sqrt\pi$ and $E(q_m)=\int(F_m-\Phi_\tau)^2dt$, the model's own excess.
 
-### 3.2 Context holes
+**Cell value.** For each model, quantity and cell:
 
-To test scarce-context behaviour without leaving the prior, carve a hole in the **context** rather than inventing query points. A synthetic $x$ far from the data could be evaluated through $\Psi_\theta$, but it would also be off the $X$ marginal, which confounds "sparse context" with "out-of-distribution $x$". Hole queries are real draws from the prior; only the context around them is missing.
+$$
+\text{value}=\log_2\frac{\text{mean estimate}}{\text{mean truth}},
+$$
 
-Per (task, seed):
+with means over all toys and queries of the cell, clipped at ±3.
 
-1. Draw a pool $P$ of $|P|=\lceil(n_{\max}+100)/(1-h)\rceil$ rows, with $h=$ `hole_frac` and $n_{\max}=1024$ (1 249 rows). This leaves room for the full context plus 100 spare rows outside the hole, and gives a hole of 125 rows.
-2. Standardize each feature over $P$ (categorical features ordinal-encoded, then standardized; an approximation, recorded as such).
-3. Pick an anchor uniformly from $P$. The **hole** $H$ is the $\lceil h|P|\rceil$ rows of $P$ nearest to the anchor (Euclidean, standardized), anchor included. That is about 10 % of the $X$ marginal's mass around the anchor, the same region for every $n$.
-4. **Context**: drawn from $P\setminus H$ once at $n_{\max}$; each $n$ uses its first $n$ rows (nested).
-5. **Hole queries**: 100 rows from $H$. **Ordinary queries**: the 100 spare rows of $P\setminus H$ that never enter the context.
+- The mean is taken first, the ratio second. A per-query ratio is not used for $\hat E$ because of the scatter of §4.5.
+- In the $\sigma=0$ row the true $A$ is 0, so a fixed floor of 0.01 is added to both means for $\hat A$.
 
-**What the hole does and does not test.** The truth $E(q_m)$ rises in the hole only if the carved region actually matters for $\Psi_\theta$. If the hole lies along features the target ignores, $E$ stays flat, and a model that simply flags feature-space isolation is graded as wrong. That is deliberate: kNN distance is the proxy that Phase 2 argues against.
+Each model uses the estimator of §2.6's legend: $e(q_m)-\hat A$ for the heteroscedastic GP and Dec-ICL, $\hat E_{\text{dir}}$ for iLTMv2.
 
-### 3.3 Truth
+### 3.4 Figure and how to read it
 
-From `R_rep` replicates $y^{(1)},\dots,y^{(R)}$ at each query (§4.2). Assert bit-identical $X$ across replicates; it is the only correctness guard the construction needs.
+**Figure.** One row per model, two heatmaps per row ($\hat A$ and $\hat E$). Colour is signed: **red** = the estimate is too high, **white** = correct, **blue** = too low.
 
-### 3.4 Models and grading
-
-Dec-ICL (§5.3) and iLTMv2 (§5.5). The heteroscedastic GP is excluded: it is 1-D only and too costly.
-
-Grading follows §6. Rows: pooled; per $n$; per query group (hole / ordinary). Two aggregation levels, each reported separately:
-
-- **Across tasks** (the calibration test): pool all tasks and seeds; bootstrap whole tasks.
-- **Within task** (descriptive): fit per task over its seeds; report the distribution (median and IQR) of per-task slope and mean signed error.
-
-The two levels mean different things. The argument of §6.1 guarantees that an ideal estimator is calibrated **on average over tasks**, not within each task: a model that cannot identify the task from its context should not be perfectly calibrated on any single one. So the across-task slope is the grade. The within-task spread shows how much a model's estimates adapt to the specific task in front of it, and whether the pooled result hides tasks where it is badly off.
+**How to read it.** A model that reads sparse data as noise is red in the left columns of its $\hat A$ panel and blue in the same cells of its $\hat E$ panel. A model that decouples correctly is white in both.
 
 ---
 
@@ -272,7 +293,7 @@ The two levels mean different things. The argument of §6.1 guarantees that an i
 
 ### 4.1 The quantities
 
-For a query $x_*$ in a task $\tau$ with true conditional law $p_\tau(\cdot\mid x_*)$, a model with forecast $q_m$ reports $\hat A$ and $\hat E$ (§5). They are graded against the **realized** truth of that task:
+For a query $x_*$ in a task $\tau$ with true conditional law $p_\tau(\cdot\mid x_*)$, a model with forecast $q_m$ reports $\hat A$ and $\hat E$ (§5). On T1 and T2 they are compared with the **realized** truth of that task:
 
 $$
 A=e\big(p_\tau(\cdot\mid x_*)\big),\qquad
@@ -282,28 +303,25 @@ $$
 - $A$ is the score that a forecaster who *knew the task* would still pay: the irreducible floor.
 - $E(q_m)$ is the extra score that *this model's own forecast* pays on top of the floor: its excess risk (Hofman et al., 2024).
 
-**Why the model's own excess.** What a user acts on is "how far off is this model's forecast likely to be, beyond the irreducible noise?". Grading against $E(q_m)$ asks whether a model **knows its own error**. For the baselines, $\hat E=e(q_m)-\hat A$ is the model's self-reported spread beyond its aleatoric part, which equals its true excess only if its members behave like a true posterior over tasks (§4.4); the gap between the two is what the tests measure. For iLTMv2, $\hat E_{\text{dir}}$ is trained to target exactly $E(q_\theta)$ (proposal §4.4). $A$ needs no such choice: it is the same for every model.
+**Why the model's own excess.** What a user acts on is "how far off is this model's forecast likely to be, beyond the irreducible noise?". Comparing with $E(q_m)$ asks whether a model **knows its own error**. For the baselines, $\hat E=e(q_m)-\hat A$ is the model's self-reported spread beyond its aleatoric part, which equals its true excess only if its members behave like a true posterior over tasks (§2.9, §4.4); the gap between the two is what the tests measure. For iLTMv2, $\hat E_{\text{dir}}$ is trained to target exactly $E(q_\theta)$ (proposal §4.4). $A$ needs no such choice: it is the same for every model.
 
-**T1 (closed form).** $p_\tau=\mathcal N\big(f(x_*),\sigma(x_*)^2\big)$, so with CRPS (Gneiting & Raftery, 2007)
+**T1, T2 (closed form).** $p_\tau=\mathcal N\big(f(x_*),\sigma(x_*)^2\big)$, so with CRPS (Gneiting & Raftery, 2007)
 
 $$
 A=\frac{\sigma(x_*)}{\sqrt\pi},\qquad E(q_m)=\int\big(F_m(t)-\Phi_\tau(t)\big)^2dt,
 $$
 
-the Cramér distance on the shared $t$-grid (§4.3), with $\Phi_\tau$ a step at $f(x_*)$ on toy rung 0.
+the Cramér distance on the shared $t$-grid (§4.3), with $\Phi_\tau$ a step at $f(x_*)$ where $\sigma(x_*)=0$ (toy rung 0; the $\sigma=0$ row of T2).
 
-### 4.2 Replicate estimators (T2, T3)
+### 4.2 Realized loss on real data (T3–T6)
 
-From $R$ i.i.d. replicates at $x_*$:
+On real data the task law is unknown, and the only ground truth is the observed label $y$ of each test point. Its realized loss is
 
 $$
-\widehat A=\frac{1}{R(R-1)}\sum_{r<s}\big|y^{(r)}-y^{(s)}\big|,\qquad
-\widehat E(q_m)=\frac1R\sum_r\mathrm{CRPS}\big(q_m,y^{(r)}\big)-\widehat A,
+\ell=\mathrm{CRPS}(q_m,y)=\int\big(F_m(t)-\mathbb 1\{t\ge y\}\big)^2dt,
 $$
 
-with $\mathrm{CRPS}(q_m,y)=\int\big(F_m(t)-\mathbb 1\{t\ge y\}\big)^2dt$. Both are exactly unbiased, so the replicate noise is zero-mean and handled by the grading (§6.1).
-
-**Replicates must be independent of the context.** If a replicate row was also in the context, $q_m$ has already seen it, and $\widehat E$ is biased downwards. On T2 this cannot happen, because replicates are fresh $U_2$ draws. On T3 it can, so it is enforced explicitly (§7.2).
+with the CDF convention of §5.4. Its expectation over $y\sim p_\tau(\cdot\mid x_*)$ is the expected score $A+E(q_m)$, so a single $\ell$ is an unbiased but noisy draw of it. This is why T3 ranks $\ell$ with total uncertainty, why T4 takes a difference of two losses at the same $y$ to cancel $A$, and why T6 averages $\ell$ over queries. None of them compares an estimate with a single realized value (§4.5).
 
 ### 4.3 Entropy and excess kernels
 
@@ -331,7 +349,7 @@ def project(cdfs, weights, t_grid):
 
 This works for any CDF: Gaussian mixture, binned predictive, point mass, a 999-quantile step function.
 
-**The $t$-grid.** 4096 points spanning $\pm10$ s.d. around the forecast, **widened to also cover the truth**: the true law on T1, all replicates on T2 and T3. One grid construction is shared by every adapter and by `truth.py`. Assert that both CDFs reach their tails inside the grid ($<10^{-4}$ at each end).
+**The $t$-grid.** 4096 points spanning $\pm10$ s.d. around the forecast, **widened to also cover the truth**: the true law on T1 and T2, the observed $y$ on T3–T6. One grid construction is shared by every adapter and by `truth.py`. Assert that both CDFs reach their tails inside the grid ($<10^{-4}$ at each end).
 
 **Unit tests.**
 
@@ -343,29 +361,7 @@ This works for any CDF: Gaussian mixture, binned predictive, point mass, a 999-q
 
 ### 4.4 What $e_{\text{tot}}-\hat A$ measures
 
-The heteroscedastic GP and Dec-ICL report $\hat E=e_{\text{tot}}-\hat A$ (§5.2, §5.3). This is **not** an approximation of the realized divergence $d_S(q_m,p_\tau)$. It is the model's own posterior expectation of that divergence, and that is an exact identity.
-
-**The identity.** Write the forecast as its mixture of members, $q_m=\sum_m w_mF_m$: posterior draws for the GP, latent bins convolved with the noise model for Dec-ICL. The expected score $\mathbb E_{Y\sim G}[S(q_m,Y)]$ is linear in the law $G$ of $Y$, so
-
-$$
-\sum_m w_m\,\mathbb E_{Y\sim F_m}\big[S(q_m,Y)\big]=\mathbb E_{Y\sim q_m}\big[S(q_m,Y)\big]=e(q_m).
-$$
-
-With $d_S(q_m,F_m)=\mathbb E_{Y\sim F_m}[S(q_m,Y)]-e(F_m)$ (§2.1 of the proposal), averaging over members gives
-
-$$
-\sum_m w_m\,d_S(q_m,F_m)\;=\;e(q_m)-\sum_m w_m\,e(F_m)\;=\;e_{\text{tot}}-\hat A .
-$$
-
-So $e_{\text{tot}}-\hat A$ is exactly the excess score the model *expects* to pay if the truth is one of its own members, drawn with its own weights: a **self-predicted excess**. It is non-negative by concavity of $e$, which is what the assertion in `project` checks. This is the decomposition of proposal §2.2, which follows Hofman et al. (2024). For the log score the same identity gives the mutual information $I(Y_*;\tau\mid x_*,D)$, the BALD term (Houlsby et al., 2011; Depeweg et al., 2018).
-
-**When it equals the truth.** If the members are the exact posterior over tasks under the prior that generated the task ($w_m,F_m$ playing the role of $p(\tau\mid D),p_\tau$), the identity becomes
-
-$$
-\mathbb E_{\tau\mid D}\big[d_S(q,p_\tau)\big]=e(q)-\mathbb E_{\tau\mid D}\big[e(p_\tau)\big],
-$$
-
-so $e_{\text{tot}}-\hat A$ is unbiased for the realized excess **on average over the tasks consistent with the context**, not on each task. That is why T2 and T3 grade truth on estimate across tasks (§6.1), and why T1, with one fixed task, is read descriptively. When the model is misspecified, its members do not cover the truth and the self-predicted excess misses the bias, which is DEUP's argument (Lahlou et al., 2023, §2). The gap between self-predicted and realized excess is exactly what the tests show. iLTMv2's $\hat E_{\text{dir}}$ is instead trained on the realized excess itself (proposal §4.4).
+The heteroscedastic GP and Dec-ICL report $\hat E=e_{\text{tot}}-\hat A$ (§5.2, §5.3). This is **not** an approximation of the realized divergence $d_S(q_m,p_\tau)$. It is the model's own posterior expectation of that divergence, $\sum_m w_m\,d_S(q_m,F_m)$, and that is an exact identity (derivation in §2.9; it is the decomposition of proposal §2.2). It is non-negative by concavity of $e$, which is what the assertion in `project` checks. It is unbiased for the realized excess only **on average over the tasks consistent with the context**, and only when the members are the exact posterior; when the model is misspecified, the self-predicted excess misses the bias (DEUP's argument; Lahlou et al., 2023, §2). iLTMv2's $\hat E_{\text{dir}}$ is instead trained on the realized excess itself (proposal §4.4).
 
 **No general ordering between $e(q_m)$ and the realized divergence.** On a single task, either can be much larger:
 
@@ -374,6 +370,30 @@ so $e_{\text{tot}}-\hat A$ is unbiased for the realized excess **on average over
 - *Centred but over-dispersed.* $q_m=\mathcal N(f,(1.2\sigma)^2)$ against $p_\tau=\mathcal N(f,\sigma^2)$ gives $e(q_m)-A=0.2\sigma/\sqrt\pi\approx0.11\sigma$ but $d_S=\big(\sqrt{2\cdot2.44/\pi}-1/\sqrt\pi-1.2/\sqrt\pi\big)\sigma\approx0.005\sigma$: near the truth the divergence is second order in the spread error, while $e(q_m)-A$ is first order.
 
 An ordering holds only in expectation, for an exact Bayesian: $\mathbb E_{\tau\mid D}[d_S]=e(q)-\mathbb E_{\tau\mid D}[A]\le e(q)$. On average, an exact Bayesian is never more wrong than its own spread suggests; on a single task it can be.
+
+### 4.5 The epistemic scatter and the performance ceiling
+
+**The statement.** No estimator can predict the realized excess of a single task exactly. It can only predict the average excess over the tasks that are consistent with the context.
+
+**Why.** The same context $D$ is compatible with many tasks, and each gives a different true law at the query. Tasks are drawn from a fixed prior, so for any query
+
+$$
+\mathbb E\big[E(q_m)\mid D,x_*\big]=\bar E(D,x_*)=\mathbb E_{\tau\mid D}\big[d_S(q_m,p_\tau)\big].
+$$
+
+Every estimate is a function of $(D,x_*)$, so $\bar E$ is the best any estimate can do. The realized value equals $\bar E$ plus a zero-mean deviation that the context cannot resolve: the **scatter**. If the deviation were predictable from the context, the forecast itself could be corrected with it.
+
+**How large it is.** The scatter is of the same order as the quantity itself. For a calibrated Gaussian forecast its coefficient of variation is between 0.72 (deterministic task) and 1.41 (noise-dominated task). With a coefficient of variation CV, the best possible error is $\mathrm{CV}^2/(1+\mathrm{CV}^2)$ times the target's second moment, so a perfect estimator has a skill well below 1. On the Phase 1 validation bank, the ceiling of the pooled $\hat E$ skill is bracketed between 0.44 and 0.64 (`phase1_design.md`, validation section).
+
+**What it means for each test.**
+
+- **T1 (toy set).** The realized excess of one function is jagged; a correct $\hat E$ is a smooth curve through it. A match in level and shape is the expected good result, not a point-by-point match.
+- **T2 (heatmap).** Cell values compare means over many toys and queries, where the scatter averages out. This is why the ratio is taken after the mean.
+- **T3, T4 (PRR).** The oracle ordering uses each point's realized loss, which no score can know. A perfect score has a PRR well below 1. PRR values compare scores on the same forecast and dataset; they are not comparable across datasets.
+
+**The same point in DEUP.** Lahlou et al. (2023, Fig. 6c and App. D) correlate predicted uncertainty with model residuals and note that the achievable correlation is far below 1. They estimate a best-case upper bound by sampling residuals from each model's own predictive distribution (0.63 ± 0.05 for DEUP against an observed 0.47 ± 0.03) and report the ratio of observed to achievable as their comparison metric. For the same reason, $R^2$ and rank correlation of an estimate against single realized values are not used as grades anywhere in Phase 0.
+
+*Optional reference line for T3.* The same idea applied to PRR: sample $y$ from the model's own forecast and compute the PRR of its score. It shows what PRR the score would get if the forecast were exactly right.
 
 ---
 
@@ -387,7 +407,7 @@ class UQOutput:
     A_hat: np.ndarray       # (n_query,) — y-units
     E_hat: np.ndarray
     e_total: np.ndarray
-    cdf: Callable           # the forecast q_m, needed for the truth E(q_m)
+    cdf: Callable           # the forecast q_m, needed for the truth E(q_m) and the realized loss
     fit_seconds: float
     extras: dict            # native outputs, unprojected, for audit
 ```
@@ -396,18 +416,18 @@ Always fill `extras`: when a figure looks wrong you will want the native numbers
 
 ### 5.1 Which model runs where
 
-| Model | T1 toy | T2 cut-graph | T3 transfer | T4 active learning |
-|---|---|---|---|---|
-| Heteroscedastic GP | ✓ | — | — | — |
-| Dec-ICL | ✓ | ✓ | ✓ | ✓ if checkpoint, else reported numbers |
-| Tuned-ICL | — | — | — | ✓ if checkpoint, else reported numbers |
-| TabICLv2 | backbone check (§2.7) | — | — | ✓ |
-| iLTMv2 | ✓ (§5.5) | adapter ready | adapter ready | adapter ready |
-| Random (TabICLv2 predictor) | — | — | — | ✓ |
+| Model | T1 toy | T2 heatmap | T3 PRR-A | T4 PRR-B | T5 active learning | T6 retrieval |
+|---|---|---|---|---|---|---|
+| Heteroscedastic GP | ✓ | ✓ (first 10 toys) | — | — | — | — |
+| Dec-ICL | ✓ if checkpoint | ✓ if checkpoint | ✓ if checkpoint | ✓ if checkpoint | ✓ if checkpoint, else reported numbers | — |
+| Tuned-ICL | — | — | ✓ if checkpoint (total, as context) | — | ✓ if checkpoint, else reported numbers | — |
+| TabICLv2 | backbone check (§2.7) | — | — | — | ✓ | — |
+| iLTMv2 | ✓ (§5.5) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Random (TabICLv2 predictor) | — | — | — | — | ✓ | — |
 
-### 5.2 Heteroscedastic GP (PyMC) — recycled
+### 5.2 Heteroscedastic GP (PyMC)
 
-The previous version's adapter is working and validated; reuse it, with a learned constant mean on the log-noise latent (below). It follows the PyMC example "Heteroskedastic Gaussian Processes", section "Sparse Heteroskedastic GP". For reference:
+The adapter (`src/adapters/hgp.py`) is working and validated, with a learned constant mean on the log-noise latent (below). It follows the PyMC example "Heteroskedastic Gaussian Processes", section "Sparse Heteroskedastic GP". For reference:
 
 - **Model.** Two latent functions, the mean $\mu(x)$ and the log noise scale $g(x)$, with $y\sim\mathcal N\big(\mu(x),e^{2g(x)}\big)$. $\mu$ has a zero mean function; $g$ has a learned constant mean $m_g\sim\mathcal N(-2,2^2)$ in standardized units (a noise s.d. of about $0.14$ s.d. of $y$ at the prior centre).
 - **Approximation.** Each latent is a DTC sparse GP over 40 inducing points evenly spaced on `x_range` (a fixed grid keeps the cost flat in $n$), with whitened inducing values: $u=Lv$, $v\sim\mathcal N(0,I)$, $L=\mathrm{chol}(K_{uu}+10^{-6}I)$, $f(X)=K_{fu}K_{uu}^{-1}u$.
@@ -415,7 +435,7 @@ The previous version's adapter is working and validated; reuse it, with a learne
 - **Inference.** NUTS through numpyro, `target_accept` $=0.95$, 2 chains × (500 tuning + 250 draws), giving $S=500$. Log R-hat, divergences, fit time and the posterior mean of $m_g$ in `extras`; flag fits with R-hat $>1.05$.
 - **Prediction.** The example's `conditional`: per posterior draw, mean $K_{su}K_{uu}^{-1}u$ plus a draw from the conditional variance $\mathrm{diag}(K_{ss}-Q_{ss})$. Only marginals at each query enter a member CDF, so the diagonal is exact here.
 - **Members.** $\{\mathcal N(\mu_s(x_*),\sigma_s(x_*)^2)\}_{s=1}^S$, $w_s=1/S$, through `project`, so $\hat A=\frac1S\sum_s\sigma_s/\sqrt\pi$.
-- **Toy rung 0.** $\sigma\equiv0$ pushes $g$ towards $-\infty$. Clip $\sigma_s$ at `sigma_floor` and report the clip rate.
+- **Toy rung 0** (and the $\sigma=0$ row of T2). $\sigma\equiv0$ pushes $g$ towards $-\infty$. Clip $\sigma_s$ at `sigma_floor` and report the clip rate.
 
 **Why the log-noise latent has a constant mean.** With zero mean functions for both latents, the GP reported $\hat A\approx420$ in the sparse strip of toy rung 0 at $n=256$ (and about 100 at $n=1024$), on a deterministic function whose whole range is under 8 units. The σ clip rate was 0 %, so the clip did not cause it: the clip only floors σ from below. The forecast band itself left the plot, so this was what the fitted model reported, and nearly all of it was aleatoric ($\hat E\approx3$ there). Two effects stacked:
 
@@ -426,7 +446,7 @@ A learned constant mean lets $g$ sit low without a large amplitude, so data-free
 
 ### 5.3 Dec-ICL (Bergna et al., 2026)
 
-The decoupled TabICL model, obtained from the authors. Until the checkpoint arrives, the adapter is written against the interface below and unit-tested on synthetic outputs (§10, gotcha 2). **Confirm the exact output format with the authors' code before finalizing.**
+The decoupled TabICL model, obtained from the authors. Until the checkpoint arrives, the adapter is written against the interface below and unit-tested on synthetic outputs (§12, gotcha 2). **Confirm the exact output format with the authors' code before finalizing.**
 
 **Native outputs** (Bergna et al., 2026, §3.1):
 
@@ -443,6 +463,8 @@ $$
 
 where $q_m$ is **their** observation-level predictive, reproduced exactly as their code builds it (point masses at $c_j$, or mass spread within bins). Any spread *within* a latent bin is uncertainty about $f$, so it belongs to $\hat E$, never to $\hat A$. If their aleatoric head outputs a distribution over $\sigma^2$ rather than a point, use $\hat A=\mathbb E[\sigma]/\sqrt\pi$ over it instead.
 
+Where only a ranking is needed (T4, T5), Dec-ICL uses its native scores: the latent variance $v_{\text{epi}}$ and the total $v_{\text{tot}}=v_{\text{epi}}+\hat\sigma^2$ (§2.9).
+
 **Checks and logs.**
 
 - Unit test: our $q_m$, integrated over their observation bins, reproduces their observation-level bin masses to $10^{-6}$.
@@ -453,115 +475,27 @@ where $q_m$ is **their** observation-level predictive, reproduced exactly as the
 
 ### 5.4 TabICLv2 (Qu et al., 2026)
 
-Total only. `e_total` and `cdf` come from the 999 raw quantiles at levels $k/1000$: the CDF is piecewise-linear through them, 0 below the first and 1 above the last, and its entropy is integrated exactly segment by segment. `A_hat` and `E_hat` are `None`; the evaluator skips them rather than coercing them to zero. Used in the backbone check (§2.7) and in T4.
+Total only. `e_total` and `cdf` come from the 999 raw quantiles at levels $k/1000$: the CDF is piecewise-linear through them, 0 below the first and 1 above the last, and its entropy is integrated exactly segment by segment. `A_hat` and `E_hat` are `None`; the evaluator skips them rather than coercing them to zero. Used in the backbone check (§2.7) and in T5.
 
 ### 5.5 iLTMv2
 
 $\hat A$ from the aleatoric head and $\hat E=\hat E_{\text{dir}}$ from the epistemic head (proposal §4.4); `e_total` and `cdf` from the quantile head. Also log $e(q_\theta)-\hat A$ in `extras`, which is the amortization gap of proposal §4.7.
 
 **Implementation** (`src/adapters/iltmv2.py`). The model is `iltm2.inference.ILTMv2Regressor` (experiment1): `fit` on the context, `predict_uncertainty` on the queries, which returns the 999 raw quantiles, $\hat A$, $\hat E_{\text{dir}}$ and $e(q_\theta)$ in $y$ units.
-- **Forward route.** Phase 1's raw training-mode forward of the frozen TabICLv2 (phase1_protocol.md §1.3), the route the heads were trained on, not `TabICLRegressor`. X and y are scaled as the training prior scaled them, with constants from the context only (robust clamp at mean ± 4 std, then standardization); quantiles map back affinely, and $\hat A$, $\hat E$, $e(q_\theta)$ scale with the context's y std.
+- **Forward route.** Phase 1's raw training-mode forward of the frozen TabICLv2 (`phase1_design.md`, Architecture, "Forward route"), the route the heads were trained on, not `TabICLRegressor`. X and y are scaled as the training prior scaled them, with constants from the context only (robust clamp at mean ± 4 std, then standardization); quantiles map back affinely, and $\hat A$, $\hat E$, $e(q_\theta)$ scale with the context's y std.
 - **Conversion.** $\hat A$ and $\hat E$ are passed through unchanged: the heads predict them, so there is no member family to project. $q_m$ is the CDF piecewise-linear through the 999 quantiles, the convention of §5.4, and `e_total` is its exact entropy.
-- **`e_total` is computed, never assembled.** It is $e(q_m)=\int F_m(1-F_m)$ of the forecast itself, integrated exactly from its quantiles, never $\hat A+\hat E$. The two heads are trained separately and nothing ties their sum to $e(q_m)$, so in the figures (row 2: $e(q_m)$ black, $\hat A$ red) $\hat A$ tracking $e(q_m)$ wherever the context is dense, and falling below it only where epistemic uncertainty rises, is a learned behaviour of the aleatoric head, not a construction. For the same reason $e(q_m)-\hat A$ is close to $\hat E$ but not identical to it: $\hat A+\hat E$ estimates the forecast's expected score $A+E(q_m)$, which equals $e(q_m)$ only when $q_m$ is the exact Bayes predictive (the CRPS divergence is symmetric). $e(q_m)-\hat A$ itself is logged in `extras` as the amortization gap (proposal §4.7). `extras` holds the quantiles, both heads' outputs, $e(q_\theta)$, the amortization gap, the y scale and the checkpoints. Unit test: `00c` (conversion only).
-- **Which checkpoints** (`configs/methods.yaml`). `iltmv2`: arm A2's checkpoints selected on Phase 1's validation bank (phase1_protocol.md §9.1); `iltmv2_a1`: arm A1's; `iltmv2_b`: arm B's selected configuration (fork + both heads, §9.2). `checkpoint_A` / `checkpoint_E` / `pair` select any other checkpoint, of any arm (A1, A2, B).
-- **Not the same forecast as the TabICLv2 row.** The TabICLv2 adapter (§5.4, backbone check) runs `TabICLRegressor` with its preprocessing and ensemble, so its $q_m$ differs from iLTMv2's. Compare their forecasts only through this route.
+- **`e_total` is computed, never assembled.** It is $e(q_m)=\int F_m(1-F_m)$ of the forecast itself, integrated exactly from its quantiles, never $\hat A+\hat E$. The two heads are trained separately and nothing ties their sum to $e(q_m)$, so in the figures (row 2: $e(q_m)$ dashed black, $\hat A$ red) $\hat A$ tracking $e(q_m)$ wherever the context is dense, and falling below it only where epistemic uncertainty rises, is a learned behaviour of the aleatoric head, not a construction. For the same reason $e(q_m)-\hat A$ is close to $\hat E$ but not identical to it: $\hat A+\hat E$ estimates the forecast's expected score $A+E(q_m)$, which equals $e(q_m)$ only when $q_m$ is the exact Bayes predictive (the CRPS divergence is symmetric). This is what T3 tests on real data. $e(q_m)-\hat A$ itself is logged in `extras` as the amortization gap (proposal §4.7) and is not drawn. `extras` holds the quantiles, both heads' outputs, $e(q_\theta)$, the amortization gap, the y scale and the checkpoints. Unit test: `00c` (conversion only).
+- **Which checkpoints** (`configs/methods.yaml`). `iltmv2`: arm A's checkpoints selected on Phase 1's validation bank; `iltmv2_b`: arm B's selected configuration (fork + both heads). `checkpoint_A` / `checkpoint_E` / `pair` select any other checkpoint of either arm (A, B), for example the candidates of the selection below.
+- **Which model is run where.** Phase 1 selects learning rates on its validation bank; the final model (arm and loss exponent $p$) is chosen among the four candidates (arms A and B, $p=0$ and $p=1$) by running them on T2–T5 (`phase1_design.md`, sweep and selection). The final model is then run on T1 and T6. The ablation counterparts of the final model (the other $p$, the other arm, the i.i.d. prior) run on T2–T5.
+- **Not the same forecast as the TabICLv2 row.** The TabICLv2 adapter (§5.4, backbone check, T5) runs `TabICLRegressor` with its preprocessing and ensemble, so its $q_m$ differs from iLTMv2's. Compare their forecasts only through this route.
 
 ---
 
-## 6. Grading (T2, T3)
+## 6. Real data: datasets and splits (T3–T6)
 
-### 6.1 The rule: regress truth on estimate
+T3–T6 share the five regression datasets of DecoupledPFN's active-learning protocol (Bergna et al., 2026, §5.3 and App. G) and one set of stored splits.
 
-The realized truth equals what a model could at best know from its context, plus a zero-mean deviation that the context cannot resolve. Tasks are drawn from a fixed prior, so for any query
-
-$$
-\mathbb E\big[T\mid D,x_*\big]=\bar T(D,x_*),\qquad T\in\{A,\,E(q_m)\},
-$$
-
-where $\bar T$ is the posterior-averaged truth under that prior. Every estimate $\hat T$ is computed from $(D,x_*)$, plus the method's own randomness, which is independent of the task given $D$. Hence $\mathbb E[T\mid\hat T]=\mathbb E[\bar T\mid\hat T]$.
-
-**Consequence:** regressing realized truth on the estimate gives the same answer as if $\bar T$ were known. Regressing the estimate on realized truth does not: noise in the regressor biases the slope towards zero, which is indistinguishable from the shrinkage we want to detect. **Never regress an estimate on realized truth.** Replicate noise is zero-mean, so the same rule covers it.
-
-This identity holds when averaging over tasks. It is why the across-task rows are the grade and the within-task rows are descriptive (§3.4).
-
-### 6.2 Metrics
-
-For each (test, method, quantity $\in\{A,E\}$), fit per-query OLS $T=a+b\,\hat T$.
-
-| Metric | Ideal | Reading |
-|---|---|---|
-| **slope $b$** (headline) | 1 | $b>1$: estimates too compressed (e.g. a shrunk $\hat E$); $b<1$: estimates exaggerate differences between queries |
-| intercept $a$ | 0 | constant offset |
-| mean signed error $\overline{T-\hat T}$ | 0 | $>0$: underestimates on average |
-
-Every metric gets a 95 % bootstrap CI, resampling **whole tasks** for the across-task rows.
-
-- **Rows.** Pooled; per $n$; per query group (T2: hole / ordinary; T3: held-out cell / other); T3 also per $(k,d)$.
-- **$R^2$ and rank correlation are not reported.** Against realized truth they are capped by the irreducible deviation and measure the testbed's noise, not the method.
-- **Diagnostics.** Log `fit_seconds`, the forward-pass count and the σ clip rate as columns.
-
-**Why sweep $n$, and why also split by it.** $E(q_m)$ typically shrinks as context grows, so sweeping $n$ moves the epistemic truth across its range and gives the pooled regression something to fit. But a method whose bias depends on $n$ gets a pooled slope that describes no context size it was actually run at; the per-$n$ rows show where it breaks. Read them with their CIs; the pooled slope stays the headline.
-
-Aggregate with medians and bootstrap CIs. Never average raw scales across tasks of different $y$-scale.
-
-### 6.3 Figures
-
-Per (test, method), **two reliability plots**:
-
-1. **$A$:** $\hat A$ on the x-axis, realized $A$ on the y-axis, linear axes.
-2. **$E$:** $\hat E$ on the x-axis, realized $E(q_m)$ on the y-axis, **log–log display**. Axes are for display only; every metric uses linear values. Values below the display floor are drawn on the floor and counted on the panel.
-
-In each plot:
-
-- per-query points in faint grey;
-- one reliability curve per $n$, coloured by $n$: `n_bins` equal-count bins of $\hat T$, bin means with bootstrap CIs, plus a pooled curve in black;
-- the $y=x$ line;
-- **a second panel per plot split by query group** (hole / ordinary, held-out cell / other), so a model that is calibrated on ordinary queries but not in holes is visible at a glance.
-
-Colouring by $n$ shows the $n$-dependent failures without another figure: an $\hat A$ that drifts with $n$ shows as separated curves in plot 1; a method that puts total uncertainty in both slots shows as plot-1 curves that bend upwards at small $n$.
-
----
-
-## 7. T3 — Transfer test
-
-### 7.1 Purpose
-
-iLTMv2's heads are trained on the observed cut, which gives up latent confounding between $X$ and $y$ (proposal §4.3). T3 asks whether the heads still report correct $A$ and $E$ on the **unmodified, fully confounded** `graph_scm`, where no closed form or replicate mechanism exists. Dec-ICL is graded the same way, as a reference.
-
-### 7.2 Ground truth by exact match
-
-Restrict every observed feature to be **categorical with low cardinality $k$**, $d$ features per task, so there are $k^d$ feature cells. Rows of the unmodified prior are i.i.d. from the joint law, so all rows sharing a query's exact feature vector are exact i.i.d. draws from $p_\tau(y\mid x_*)$. There is no distance threshold and no bandwidth.
-
-Per (task, seed):
-
-1. Draw one large pool $P$ from the unmodified prior.
-2. Group $P$ by exact feature vector. A cell is **eligible** for queries if it holds at least `R_min` $=30$ rows beyond those that could enter the context.
-3. **Held-out cells.** Mark 10 % of eligible cells as held out; remove all their rows from the context candidates.
-4. **Context**: drawn from the remaining rows once at $n_{\max}$, nested across $n$. If $n_{\max}$ exceeds the rows available, cap `n_grid` for that $(k,d)$ and log it.
-5. **Queries**: 100 from held-out cells, 100 from the other eligible cells.
-6. **Replicates** for a query: rows of its cell that are **not in the context**, capped at `R_rep`. Truth by §4.2 with that $R$; log $R$ per query.
-
-Query groups are by design: **held-out cell** vs **other**. At small $n$, many "other" cells are unseen by chance; the held-out group guarantees an unseen cell at every $n$.
-
-Provisional sweep (`transfer.yaml`): $k\in\{2,3,5\}$, $d\in\{2,3,4\}$, skipping combinations with $k^d>256$. Pool size is chosen so the expected count per cell is at least $3\,$`R_min`. `n_tasks` and `n_task_seeds` as in T2.
-
-**Limitation.** Continuous-feature tasks are covered only by extrapolation from this regime.
-
-> **TBD.** How to force `graph_scm`'s converters to emit only $k$-level categorical features without otherwise changing the prior; whether mixed categorical/continuous tasks can be included (they cannot use exact match).
-
-### 7.3 Models and grading
-
-Dec-ICL and iLTMv2, graded exactly as T2 (§6), with the same across-task and within-task levels, plus per-$(k,d)$ rows.
-
----
-
-## 8. T4 — Active learning
-
-Reuses the active-learning protocol of DecoupledPFN (Bergna et al., 2026, §5.3 and App. G). It checks whether the epistemic estimate **selects useful data**, not whether it is numerically right. It is the cheapest preview of Phase 2 (context retrieval without training).
-
-### 8.1 Protocol
-
-| Dataset | Dim | $n_0$ | $n_q$ | Pool | Test | Seeds | Source |
+| Dataset | Dim | $n_0$ (warm start) | $n_q$ (acquisitions) | Pool | Test | Seeds | Source |
 |---|---|---|---|---|---|---|---|
 | California Housing | 8 | 1024 | 1024 | 5000 | 3000 | 16 | TBD |
 | Kin8nm | 8 | 1024 | 1024 | 5000 | 3000 | 20 | TBD |
@@ -571,17 +505,104 @@ Reuses the active-learning protocol of DecoupledPFN (Bergna et al., 2026, §5.3 
 
 > **TBD — dataset sources.** Exact OpenML IDs and versions (the paper does not give them).
 
-- **Splits.** For each (dataset, seed), fix the pool/test split and the $n_0$ warm-start indices once, and share them across all methods. Store them in `outputs/raw/`, as the paper does (App. G.5).
+- **Splits.** For each (dataset, seed), fix the pool/test split and the $n_0$ warm-start indices once, and share them across all methods and all four tests. Store them in `outputs/raw/`, as the paper does (App. G.5). They are ordinary random splits: no carved regions.
+- **Uses.** T3: context = warm-start set + pool (6,024 rows), queries = the test set. T4: the same full context, plus a small context = the first 256 rows of the warm-start set. T5: the warm-start set grows by acquisition from the pool. T6: starting context = the first 256 rows of the warm-start set, the pool as the labelled candidates, queries drawn from the test set.
+- **Test points are never context rows**, in any of the four tests.
+
+---
+
+## 7. T3 — PRR-A, ranking total error
+
+### 7.1 What it shows
+
+Whether the two heads together predict how large the forecast's loss will be, better than the forecast's own spread does.
+
+- $e(q_\theta)$ is what the forecast expects to pay if it is right about itself.
+- $\hat A+\hat E_{\text{dir}}$ is the learned estimate of what it actually pays (the expected score of $q_\theta$; proposal §2.2, §5.5 above).
+- Both score the same forecast and the same errors, so the comparison is clean.
+
+The observed loss on real data includes noise (§4.2), so total uncertainty is the right ranker of it. That is why the sum is used here.
+
+### 7.2 Construction
+
+1. **Data.** The five datasets and their stored splits (§6).
+2. **Forecast.** Context = warm-start set + pool (6,024 rows); queries = the test set. One raw forward of iLTMv2, the route the heads were trained on (§5.5).
+3. **Loss.** $\ell_i=\mathrm{CRPS}(q_i,y_i)$ per test point, with the CDF convention used everywhere else (§4.2, §5.4).
+4. **Scores.** $s_i^{\text{tot}}=e(q_i)$ and $s_i^{\text{dec}}=\hat A_i+\hat E_i$.
+5. **Rejection curve.** Sort the test points by a score, highest first. After rejecting the first $k$, the curve value is the summed loss of the retained points divided by the total count $N$. Rejected points contribute 0: they are handed to an oracle that knows the outcome, and a point mass at the true $y$ has a CRPS of exactly 0.
+6. **Reference curves.** Random rejection is the straight line from the mean loss to 0. The oracle ordering sorts by $\ell_i$ itself.
+7. **PRR.**
+
+$$
+\mathrm{PRR}=\frac{AU_{\text{random}}-AU_{\text{score}}}{AU_{\text{random}}-AU_{\text{oracle}}},
+$$
+
+with $AU$ the area under each curve. 1 is the oracle ordering, 0 is random, negative is worse than random.
+
+### 7.3 Outputs
+
+- **Figure:** one panel per dataset with four curves (oracle, $e(q)$, $\hat A+\hat E$, random), averaged over seeds.
+- **Table:** per dataset, the PRR of $e(q)$ and of $\hat A+\hat E$ (mean ± s.d. over seeds) and their paired difference.
+
+**If the Dec-ICL checkpoints arrive.** Dec-ICL's decomposition sums to its total by construction, so on its own forecast it has one score (its total), shown next to Tuned-ICL's total as context.
+
+**Expectation.** The two scores differ only where the backbone is wrong about itself, so the gap on ordinary splits may be small. This is stated before running.
+
+A perfect score has a PRR well below 1 (§4.5); the optional reference line of §4.5 shows what PRR the score would reach if the forecast were exactly right.
+
+---
+
+## 8. T4 — PRR-B, ranking reducible error
+
+### 8.1 What it shows
+
+Whether $\hat E$ tells which predictions would improve with more data. This is what "epistemic" means operationally, and it gives an epistemic ground truth on real data without replicates.
+
+**The idea.** Predict each test point twice, with a small context and with the full one, and rank the improvement:
+
+$$
+\Delta_i=\mathrm{CRPS}\big(q_i^{\text{small}},y_i\big)-\mathrm{CRPS}\big(q_i^{\text{full}},y_i\big).
+$$
+
+In expectation, $\Delta_i$ is the excess with the small context minus the excess with the full one. The aleatoric term is the same in both and cancels. So $\Delta$ measures reducible error only.
+
+### 8.2 Construction
+
+1. **Data.** Same datasets, splits and seeds as T3 (§6).
+2. **Contexts.** Small = the first 256 rows of the warm-start set. Full = warm-start set + pool (6,024 rows).
+3. **Scores.** From the small-context forward only: $\hat E_i$ against $e(q_i)$, the total-uncertainty baseline. Nothing from the full-context forward is used for ranking.
+4. **Curve and PRR.** As in T3 with $\ell_i$ replaced by $\Delta_i$. The oracle ordering sorts by $\Delta_i$.
+
+### 8.3 Outputs and reading notes
+
+**Outputs.** As in T3: one panel per dataset (oracle, $e(q)$, $\hat E$, random) and a table with the PRR of both scores per dataset.
+
+**Reading notes.**
+
+- $\Delta_i$ can be negative for single points, so a curve can dip below 0 before returning to it. The PRR formula is unchanged.
+- $\Delta_i$ is a difference of two noisy losses, so absolute PRR values will be low (§4.5). The comparison between the two scores is what counts.
+
+**If the Dec-ICL checkpoints arrive.** Same test on its own forecasts: $v_{\text{epi}}$ against $v_{\text{tot}}$. The comparison across models is then how much each decomposition gains over its own total, as in T5.
+
+---
+
+## 9. T5 — Active learning
+
+Reuses the active-learning protocol of DecoupledPFN (Bergna et al., 2026, §5.3 and App. G). It checks whether the epistemic estimate **selects useful data**, not whether it is numerically right. With T6, it is the cheapest preview of Phase 2 (context retrieval without training).
+
+### 9.1 Protocol
+
+- **Data and splits.** §6.
 - **Loop.** At each step the model, with the current labelled set as context, scores every remaining pool point. The highest-scoring point is labelled and added. 1024 steps, one point at a time, no training.
 - **Metrics.** On the test set: RMSE, MAE, Gaussian NLL (from the forecast's mean and variance, as in the paper's Table 6), and CRPS. Report final-step values as mean ± std over seeds, plus learning curves of RMSE and CRPS against the number of labelled points.
 
-### 8.2 Methods
+### 9.2 Methods
 
 | Method | Predictor | Acquisition score | Status |
 |---|---|---|---|
 | Random | TabICLv2 | uniform over the pool | run |
 | TabICLv2 (total) | TabICLv2 | $e(q_\theta)$, total CRPS entropy | run |
-| iLTMv2 | iLTMv2 | $\hat E_{\text{dir}}$ | row reserved for Phase 1 |
+| iLTMv2 | iLTMv2 | $\hat E_{\text{dir}}$ | run on Phase 1's selected checkpoints (§5.5) |
 | Tuned-ICL | Tuned-ICL | total predictive variance, as in the paper | run if checkpoint, else paper's Table 2 |
 | Dec-ICL | Dec-ICL | latent (epistemic) variance, as in the paper | run if checkpoint, else paper's Table 2 |
 
@@ -591,66 +612,125 @@ Reuses the active-learning protocol of DecoupledPFN (Bergna et al., 2026, §5.3 
 
 ---
 
-## 9. RNG streams
+## 10. T6 — Context retrieval
+
+### 10.1 What it shows
+
+For one query and a fixed starting context: given an extra labelled pool and a budget of $N$ rows, which selection rule gives the best forecast at that query? It compares $\hat E$-guided selection with k-NN and with random selection. It is a prelude to Phase 2, run on a Phase 1 checkpoint with no extra training.
+
+### 10.2 Set-up
+
+| Element | Setting |
+|---|---|
+| Data | The five datasets and splits of §6 (start with one dataset, 5 seeds) |
+| Starting context $S_0$ | The first 256 rows of the warm-start set |
+| Pool | The 5,000-row pool, labels known |
+| Queries | 200 points drawn from the test set |
+| Budgets $N$ | 16, 64, 256 |
+
+### 10.3 Methods
+
+| Method | Rule |
+|---|---|
+| Start only | $S_0$, no additions (reference) |
+| Random | $N$ random pool rows, the same for all queries |
+| k-NN | The $N$ pool rows nearest to $x_*$ in standardized $X$ |
+| $\hat E$-greedy | Below |
+| $e(q)$-greedy | Same procedure with $e(q)$ as the score (control: is the gain due to the epistemic head or to the greedy search?) |
+| Whole pool | $S_0$ + all 5,000 rows (reference) |
+
+**$\hat E$-greedy.** Selection runs in 8 rounds, adding $b=N/8$ rows per round. In each round, for each query:
+
+1. Build a shortlist of 64 candidates from the remaining pool: the 32 nearest to $x_*$ and 32 drawn uniformly at random.
+2. For each candidate $c$, run the model with context $S\cup\{c\}$ and read $\hat E_{\text{dir}}(x_*,S\cup\{c\})$.
+3. Add the $b$ candidates with the lowest value to $S$.
+
+This costs about 500 small forwards per query at any budget.
+
+**Why a mixed shortlist.** Scoring the whole pool every round is too expensive. A shortlist of nearest neighbours only would let $\hat E$ do no more than reorder k-NN's own picks, which contradicts the reason for the test: informative rows may be spread out, not near (proposal §5.2). A purely random shortlist would almost never contain the nearest rows and would handicap $\hat E$ against k-NN, which sees the whole pool. The mixed shortlist lets $\hat E$ take k-NN's picks when they are best and go elsewhere when they are not.
+
+### 10.4 Metric and reporting
+
+**Metric.** Realized $\mathrm{CRPS}(q,y)$ at the query (§4.2), averaged over queries, per budget, paired across methods. Never $\hat E$ itself.
+
+**Reported alongside.**
+
+- The share of selected rows that came from the random half of the shortlist. Near zero means $\hat E$ behaves like k-NN, which is a finding in itself.
+- Exhaustive scoring of the whole pool for 20 queries, to show what the shortlist loses.
+
+**Check before building** (`06_retrieval.py --resolution-check`). Adding one row to 256 may move $\hat E$ by less than the head can resolve. For a few queries, look at the spread of $\hat E(x_*,S\cup\{c\})$ over candidates. If it is flat, score blocks of 8 rows instead of single rows.
+
+**Cautions, stated with the results.**
+
+- **Selection sees the labels.** The heads' targets are valid because every training split rule looks at $X$ only. Greedy selection uses each candidate's label through the forward pass, so $\hat E$ can be biased low on the chosen context. This is why the metric is the realized loss.
+- **The whole-pool line may win.** TabICLv2 takes tens of thousands of context rows, so a small budget is artificial at these dataset sizes.
+- **Use a checkpoint trained with subsampled contexts.** Phase 1's stage-1 subsampled pass (`phase1_design.md`, task construction) shows the heads the same task under two contexts; it is what teaches the head how $\hat E$ changes with the context.
+
+---
+
+## 11. RNG streams
 
 Every RNG stream hangs off `base_seed`:
 
 - **T1:** function `toy_seed` (frozen by curation); context `[base, toy, 1]`, shared across toy rungs; noise $\varepsilon$ `[base, toy, 2]`, shared across toy rungs; model fit `[base, toy, rung, 3, n]`.
-- **T2:** task `[base, cg, task, 0]`; rows of a seed `[base, cg, task, seed, 1]`; anchor `[…, 2]`; context `[…, 3]`; replicates `[…, 4]`; fit `[…, 5, n]`.
-- **T3:** task `[base, tr, k, d, task, 0]`; pool `[…, seed, 1]`; held-out cells `[…, 2]`; context and queries `[…, 3]`; fit `[…, 4, n]`.
-- **T4:** splits as stored in `outputs/raw/`.
+- **T2:** one stream family per toy for the function, the strip position, the background ($d_{\text{bg}}$, $\sigma_{\text{bg}}$, context $x$) and the standard-normal noise draws, all shared by the toy's 30 cells; the in-strip context points of a cell are the first $n$ of one nested draw per toy; model fit per (toy, cell). Stream layout TBD when `heatmap.py` is written.
+- **T3–T6:** splits as stored in `outputs/raw/` (§6). T6's query draw, the random halves of the shortlists and the Random method's rows get their own streams per (dataset, seed); layout TBD when `retrieval.py` is written.
 
-One parquet per (test, method, configuration, $n$, seed) in `outputs/raw/`, reused on re-runs; figures go to `outputs/figures/`, tables to `outputs/tables/`.
+One parquet per (test, method, configuration, $n$ or cell, seed) in `outputs/raw/`, reused on re-runs; figures go to `outputs/figures/`, tables to `outputs/tables/`.
 
 ---
 
-## 10. Gotchas
+## 12. Gotchas
 
 1. **The truth code is a model too.** Validate it before running any model. `00b_validate_estimators.py`:
    - **$A$:** on toy rungs 0–2, at 50 queries with $10^5$ replicate pairs, $\tfrac12|y^{(1)}-y^{(2)}|$ averaged per query must lie within 3 Monte Carlo standard errors of $\sigma(x_*)/\sqrt\pi$. This shows exactly 0 on toy rung 0, a flat line on toy rung 1, and the noise bump on toy rung 2.
-   - **$E$:** for a fixed, deliberately wrong Gaussian forecast, the replicate estimator of §4.2 with $R=100$, repeated 1000 times, must average to the closed-form $\int(F_m-\Phi_\tau)^2dt$ within 3 standard errors. Also report its per-query s.d. at $R=100$: that is the Monte Carlo noise T2 and T3 will carry.
+   - **$E$:** for a fixed, deliberately wrong Gaussian forecast, the average over $R=100$ replicates of $\mathrm{CRPS}(q_m,y^{(r)})$ minus the unbiased replicate entropy $\frac{1}{R(R-1)}\sum_{r<s}|y^{(r)}-y^{(s)}|$, repeated 1000 times, must average to the closed-form $\int(F_m-\Phi_\tau)^2dt$ within 3 standard errors. This checks the closed-form excess (T1, T2) and the CRPS at an observation (§4.2, T3–T6) against each other; it also reports the per-query s.d. at $R=100$.
 
-   This is also the estimator audit Phase 1 calls for, run once here so both phases can cite it.
+   The replicate formulas are Phase 1's target estimators (proposal §2); auditing them here, once, lets Phase 1 cite this check instead of repeating it.
 2. **Test the conversion, not the model.** `00c_validate_adapters.py` unit-tests each adapter's path from native outputs to `UQOutput` with synthetic native outputs and closed-form answers, no model fit:
    - $M$ identical members $\mathcal N(\mu,s^2)$ must give $\hat A=e_{\text{tot}}=s/\sqrt\pi$ and $\hat E=0$;
    - a Gaussian mixture must match the folded-normal closed form;
    - Dec-ICL: a one-hot latent distribution must give $\hat E\approx0$ (up to the bin-width floor) and $\hat A=\hat\sigma/\sqrt\pi$; our $q_m$ must reproduce their observation-level bin masses;
+   - iLTMv2: quantiles and heads pass through unchanged, and `e_total` is the quantile CDF's own entropy, never $\hat A+\hat E$;
    - use several query rows with distinct parameters, so that an axis mix-up fails.
 
    Tolerances: $10^{-6}$ relative on $\hat A$ and $e_{\text{tot}}$; $10^{-6}$ of $e_{\text{tot}}$ absolute on $\hat E$.
-3. **$\sigma\to0$.** Log-parameterized heads diverge on toy rung 0. Clip every predicted σ at `sigma_floor` and **report the clip rate**: a method that passes toy rung 0 only because of the clip has not passed it.
-4. **No tuning on query points.** Baselines may use a validation split carved from the context, never the queries. On T3, replicate rows must never be context rows (§4.2).
-5. **Fix the row set and the toy function before the first run.** The iLTMv2 rows stay visibly empty until Phase 1. Adding methods after seeing results, or re-curating $f$ after seeing figures, is how benchmarks become advocacy.
-6. **Never regress an estimate on realized truth** (§6.1).
+3. **$\sigma\to0$.** Log-parameterized heads diverge on toy rung 0 and in the $\sigma=0$ row of T2. Clip every predicted σ at `sigma_floor` and **report the clip rate**: a method that passes toy rung 0 only because of the clip has not passed it.
+4. **No tuning on query points.** Baselines may use a validation split carved from the context, never the queries. On T3–T6, test points never enter the context (§6).
+5. **Fix the row set, the toy function and the T2 grid before the first run.** Adding methods after seeing results, re-curating $f$ after seeing figures, or re-tuning the heatmap grid after seeing cells is how benchmarks become advocacy. The one recorded deviation is `n_grid` (§1).
+6. **Mean first, ratio second.** A single realized excess or loss carries the scatter of §4.5. T2 takes the ratio of means; T3 and T4 rank realized losses; T6 averages realized losses over queries. Never grade $\hat E$ against one realized value, and never report $R^2$ or rank correlation against realized truth as a grade.
 
 ---
 
-## 11. Order of work
+## 13. Order of work
 
 | # | Task | Size |
 |---|---|---|
-| 1 | Recycle `entropy.py` and its unit tests; `truth.py` + `00b` estimator checks | half a day |
+| 1 | `entropy.py` and its unit tests; `truth.py` + `00b` estimator checks | half a day |
 | 2 | Toy function + curation script + toy rung configs | half a day |
-| 3 | Recycle the heteroscedastic GP adapter; run it on toy rungs 0–2 | half a day |
-| 4 | Recycle `figures.py` (3×4 context figures); GP figures | half a day |
+| 3 | Heteroscedastic GP adapter; run it on toy rungs 0–2 | half a day |
+| 4 | `figures.py` (3×4 context figures); GP figures | half a day |
 | 5 | TabICLv2 adapter + backbone check (§2.7). **Decision point:** keep $f$ or switch to the fallback note | half a day |
-| 6 | Dec-ICL adapter against the interface + `00c` unit tests; run when the checkpoint arrives | 1 day |
-| 7 | Active-learning harness: splits, loop, metrics; Random + TabICLv2 (total); Tuned-ICL / Dec-ICL if available | 1.5 days |
-| 8 | T2: cut-graph tasks, holes, replicates, grading (needs the Phase 1 observed-cut prior) | 2 days |
-| 9 | T3: categorical pools, held-out cells, exact-match replicates, grading | 1.5 days |
-| 10 | (Optional) appendix seed-averaged reliability on the toy generator (§2.8 note) | half a day |
+| 6 | Toy set at `n_grid` $=\{64,256,1024,4096\}$ (nested-context assert, §1), row-3 estimator legend, per-model row-2 limits on toy rung 0; iLTMv2 adapter + `00c` | TBD |
+| 7 | Dec-ICL adapter against the interface + `00c` unit tests; run when the checkpoint arrives | 1 day |
+| 8 | T2: probe-strip generator, cells, heatmap figure; heteroscedastic GP on its 10 toys | TBD |
+| 9 | Datasets and stored splits (§6); T5 harness: loop, metrics; Random + TabICLv2 (total); Tuned-ICL / Dec-ICL if available | 1.5 days |
+| 10 | T3 and T4: PRR scripts on the stored splits | TBD |
+| 11 | T6: retrieval script, starting with the resolution check (§10.4) | TBD |
 
-Items 1–5 already give a reportable result: the toy figures for the heteroscedastic GP, plus the motivating TabICLv2 figure.
+Items 1–5 already give a reportable result: the toy figures for the heteroscedastic GP, plus the motivating TabICLv2 figure. The baselines (heteroscedastic GP, the TabICLv2 rows, Dec-ICL if its checkpoint arrives) are run on T1, T2 and T5 once items 6–11 are written. After Phase 1's selection, the iLTMv2 candidates run on T2–T5, and the final model on T1 and T6 (§5.5).
 
 ---
 
-## 12. Open items
+## 14. Open items
 
-1. T2 generator settings and rejection filter (Phase 1 document).
-2. T3: forcing $k$-level categorical features in `graph_scm`; final $(k,d)$ sweep.
-3. Dec-ICL and Tuned-ICL checkpoints (authors contacted); Dec-ICL output format and backbone version.
-4. Active-learning dataset sources.
-5. Phase 0 kill criterion.
+1. Dec-ICL and Tuned-ICL checkpoints (authors contacted); Dec-ICL output format and backbone version.
+2. Dataset sources of §6.
+3. Phase 0 kill criterion.
+4. **Model selection on the test data.** The final iLTMv2 model and its $p$ are chosen with T2–T5 (§5.5), and the same tests are then reported. That is mildly optimistic. Either state it with the results, or select on a fixed subset (for example T2 plus one dataset) and report on the rest. TBD.
+5. **PRR-A may show a small gap.** $\hat A+\hat E$ and $e(q)$ differ only where the backbone is miscalibrated; on ordinary splits of these five datasets the difference could be within noise (§7.3).
+6. **PRR-B and retrieval depend on how sensitive $\hat E$ is to the context.** Both are constructions with no published reference numbers. The PRR-B contrast of 256 against 6,024 rows is one choice, and the result may depend on it. The resolution check (§10.4) is the first look at this sensitivity.
+7. **No ground-truth test beyond 1-D.** The only "is the number right" evidence in Phase 0 is 1-D with Gaussian noise (T1, T2); what the observed cut gives up (latent confounding, proposal §4.3) is not measured in Phase 0. A reliability plot from Phase 1's validation bank costs nothing and could sit in the appendix.
 
 ---
 
@@ -671,9 +751,9 @@ Items 1–5 already give a reportable result: the toy figures for the heterosced
 
 ### Appendix — why realized-task truth instead of an oracle
 
-The alternative was to grade against the **posterior-averaged** truth $\bar T=\mathbb E_{\tau\mid D}[\,\cdot\,]$, computed by an oracle: an exact posterior over tasks given each context.
+The alternative was to compare against the **posterior-averaged** truth $\bar T=\mathbb E_{\tau\mid D}[\,\cdot\,]$, $T\in\{A,E(q_m)\}$, computed by an oracle: an exact posterior over tasks given each context.
 
-- **What the oracle would buy.** A per-query target with no noise, allowing estimate-on-truth scatter plots and $R^2$.
-- **What it costs.** A posterior for every (task, $n$). On the old toy prior, that took hours, needed its own Monte Carlo validation, and forced the noise prior onto a grid. On T2 and T3 it is not available at all.
-- **Why the realized truth is enough.** Tasks are drawn from a fixed prior, so the realized truth averages exactly to $\bar T$ given the context (§6.1). Truth-on-estimate grading across tasks therefore gives the same answer as the oracle, at zero cost.
+- **What the oracle would buy.** A per-query target with no scatter (§4.5), allowing per-query comparisons and $R^2$.
+- **What it costs.** A posterior for every (toy, $n$) on T1 and every (toy, cell) on T2: hours per posterior, its own Monte Carlo validation, and a noise prior forced onto a grid. On the real data of T3–T6 it is not available at all.
+- **Why the realized truth is enough.** Tasks are drawn from a fixed prior and every estimate is a function of $(D,x_*)$, so the realized truth averages exactly to $\bar T$ given the context (§4.5). T2's cell means over many toys therefore give the same answer as the oracle would, at zero cost, and T3–T6 rank or average realized losses, which need no oracle.
 - **What is given up.** Per-query exactness and $R^2$. On T1 nothing is given up: the task is fixed and known, so the truth is exact per query.

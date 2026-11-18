@@ -1,20 +1,21 @@
-"""Validation of head pairs on the fixed bank and the mini-bank (phase1_protocol.md §7.4-7.5; design Training §3).
+"""Validation of head pairs on the fixed bank and the mini-bank (phase1_protocol.md §7.4-7.5; design Training §3;
+transfer guide §3.3-3.4, §3.10).
 
 WHAT IS FIXED AND WHAT IS NOT
-    The bank stores, per query, the targets (t_A, t_E, half splits) and e(q_theta) of the frozen forecast, and the
-    reference lines (`iltm2.prior._bank`, scripts/01_make_val_bank.py). The PPD is frozen in every arm, so none of
-    that is recomputed: validating a head pair = getting its INPUT for every bank query, running the heads, and
-    scoring the predictions with `iltm2.train._metrics.head_metrics` against the stored targets.
+    The bank stores, per query, the targets (t_A, t_E, half splits) and e(q_theta) of the frozen forecast, the
+    weight floor c, and the reference lines (`iltm2.prior._bank`, scripts/01_make_val_bank.py). The PPD is frozen in
+    every arm, so none of that is recomputed: validating a head pair = getting its INPUT for every bank query, running
+    the heads, and scoring the predictions with `iltm2.train._metrics.head_metrics` against the stored targets, in
+    both weightings.
 
 THE INPUTS, CACHED OR RECOMPUTED (protocol §1.3, "Precomputed bank targets")
     The inputs are a deterministic function of the frozen backbone, except arm B's fork output. `BankEvaluator`
     can cache, once at job start, any of:
-        "h"      h_star per query (A1)          bank: about 6.4 GB in CPU RAM (3.1M queries x 512 x 4 bytes)
-        "taps"   the 12 taps per query (A2)     bank: about 77 GB, too large: recomputed; mini-bank: about 0.6 GB
-        "fork"   the fork input, ALL rows (B)   bank: about 30 GB: recomputed; mini-bank: about 0.13 GB
-    Intended use: A jobs cache "h" on the bank and ("h", "taps") on the mini-bank; B jobs cache "fork" on the
-    mini-bank only. A pass that needs an input that is not cached runs the backbone forward task by task (one task
-    at a time, as the bank was built) and serves every pair from it.
+        "h"      h_star per query (arm A)       bank: about 6 GB in CPU RAM (~3M queries x 512 x 4 bytes)
+        "fork"   the fork input, ALL rows (B)   bank: tens of GB: recomputed; mini-bank: small
+    Intended use: A jobs cache "h" on the bank and on the mini-bank, so an A validation costs only the head MLPs
+    (transfer guide §3.3); B jobs cache "fork" on the mini-bank only. A pass that needs an input that is not cached
+    runs the backbone forward task by task (one task at a time, as the bank was built) and serves every pair from it.
 
 GUARDS
     - The backbone's sha256 must equal the bank's (the targets belong to one specific forecast).
@@ -28,9 +29,10 @@ GUARDS
     - Task order: tasks are read in bank order and each one's id and query count are checked against the query
       table, so predictions line up with the targets row by row (`check_alignment` does this without forwards).
 
-BEST-PER-HEAD CHECKPOINTS (design Training §3)
-    `BestTracker` keeps, per (head pair, head), the lowest pooled validation MSE seen so far ("val/mse_<h>/all" on
-    the full bank, never the mini-bank) and flags when it improves; the trainer then overwrites best/<id>_<h>.pt.
+BEST-PER-HEAD CHECKPOINTS (design Training §3; transfer guide §3.10, step 1)
+    `BestTracker` keeps, per (head pair, head), the lowest pooled full-bank validation MSE seen so far under the
+    pair's OWN weighting ("val/mse_<h>/all" for p = 0, "val/wmse_<h>/all" for p = 1; never the mini-bank) and flags
+    when it improves; the trainer then overwrites best/<id>_<h>.pt.
 """
 from __future__ import annotations
 
@@ -40,21 +42,23 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
-from iltm2.model._heads import HEADS, Fork, HeadPair, select_input
+from iltm2.model._heads import HEADS, Fork, HeadPair
 from iltm2.prior._bank import iter_tasks, load_manifest, load_queries
-from iltm2.train._metrics import head_metrics
+from iltm2.train._metrics import N_BIN_NAMES, head_metrics
 
 E_Q_ATOL, E_Q_RTOL = 1e-6, 1e-3    # e(q) guard, relative to the task's mean e(q) (docstring, GUARDS)
-CACHE_KINDS = ("h", "taps", "fork")
+CACHE_KINDS = ("h", "fork")
+INPUT_OF = {"A": "h", "B": "fork"}
+MINI_SLICES = ("all", *N_BIN_NAMES)  # the mini-bank's slices: pooled and by context size (guide §5 Step 3)
 
 
 class BankEvaluator:
     """Head-pair validation on one bank (full or mini). Not tied to a trainer: it holds the query table, the
-    reference lines and optional input caches, and is given the head pairs (and B's fork) at each call.
+    reference lines, the weight floor c and optional input caches, and is given the head pairs (and B's fork) at
+    each call.
 
     root      the bank directory (the mini-bank is root/mini, selected by `mini=True`)
-    backbone  the job's FrozenBackbone (taps enabled if A2 pairs are evaluated without a "taps" cache; fork_k set
-              if B is evaluated without a "fork" cache)
+    backbone  the job's FrozenBackbone (fork_k set if B is evaluated without a "fork" cache)
     cache     input kinds to cache at construction (module docstring)
     """
 
@@ -66,6 +70,7 @@ class BankEvaluator:
             f"backbone sha256 {backbone.sha256[:12]}... is not the bank's {man['backbone']['sha256'][:12]}...: "
             "the bank's targets belong to another forecast")
         self.offsets = man["task_offsets"]
+        self.c = float(man["loss_c"])
         self.Q = load_queries(self.root, mini=mini)
         self.refs: Dict[str, float] = man["mini"]["reference_lines"] if mini else man["reference_lines"]
         self.ref_prefix, self.prefix = ("ref_mini", "mini") if mini else ("ref", "val")
@@ -127,8 +132,6 @@ class BankEvaluator:
     def build_cache(self, kinds: Iterable[str]):
         kinds = tuple(kinds)
         assert all(k in CACHE_KINDS for k in kinds), kinds
-        if "taps" in kinds:
-            assert self.backbone.tap_layers, "caching taps needs a backbone with tap_layers"
         if "fork" in kinds:
             assert self.backbone.fork_k is not None, "caching the fork input needs a backbone with fork_k"
         store = {k: [] for k in kinds}
@@ -136,83 +139,79 @@ class BankEvaluator:
             out = self._forward(i, rec)
             if "h" in kinds:
                 store["h"].append(out.h_star[0].float().cpu())
-            if "taps" in kinds:
-                store["taps"].append(out.taps[0].float().cpu())
             if "fork" in kinds:
                 store["fork"].append(out.fork_input[0].float().cpu())
         self.cache.update(store)
 
     # ----- predictions
 
-    @staticmethod
-    def _needs(pairs: Sequence[HeadPair]) -> set:
-        return {{"A1": "h", "A2": "taps", "B": "fork"}[p.arm] for p in pairs}
-
     @torch.no_grad()
     def predict(self, pairs: Sequence[HeadPair], fork: Optional[Fork] = None) -> Dict[str, Dict[str, Tensor]]:
         """{head_id: {"A": Â, "E": Ê_dir}} over every query of the table, in table order (float32, CPU)."""
-        needs = self._needs(pairs)
+        ids = [p.head_id for p in pairs]
+        assert len(set(ids)) == len(ids), f"head ids must be unique (predictions are keyed by them): {ids}"
+        needs = {INPUT_OF[p.arm] for p in pairs}
         if "fork" in needs:
             assert fork is not None, "B pairs need the fork"
         recompute = not needs <= set(self.cache)
-        if recompute:
-            if "taps" in needs:
-                assert self.backbone.tap_layers, "A2 pairs without a taps cache need a backbone with taps"
-            if "fork" in needs:
-                assert self.backbone.fork_k is not None, "B pairs without a fork cache need fork_k on the backbone"
+        if recompute and "fork" in needs:
+            assert self.backbone.fork_k is not None, "B pairs without a fork cache need fork_k on the backbone"
         parts: Dict[str, Dict[str, List[Tensor]]] = {p.head_id: {h: [] for h in HEADS} for p in pairs}
         dev = self.device
         tasks = self._records() if recompute else ((i, None) for i in range(len(self.task_ids)))
         for i, rec in tasks:
             if recompute:
                 out = self._forward(i, rec)
-                h_star, taps, fork_in, ts = out.h_star, out.taps, out.fork_input, out.train_size
+                inputs = {"h": out.h_star, "fork": out.fork_input}
+                ts = out.train_size
             else:
-                get = lambda k: self.cache[k][i].to(dev)[None] if k in needs else None  # noqa: E731
-                h_star, taps, fork_in = get("h"), get("taps"), get("fork")
-                ts = None if fork_in is None else fork_in.shape[1] - (self.bounds[i][1] - self.bounds[i][0])
-            fork_h = fork(fork_in.to(dev), ts) if "fork" in needs else None
+                inputs = {k: self.cache[k][i].to(dev)[None] for k in needs}
+                ts = (inputs["fork"].shape[1] - (self.bounds[i][1] - self.bounds[i][0])) if "fork" in needs else None
+            if "fork" in needs:
+                inputs["fork_h"] = fork(inputs["fork"].to(dev), ts)
             for p in pairs:
-                a, e = p(select_input(p.arm, h_star=h_star, taps=taps, fork_h=fork_h))
+                a, e = p(inputs["h"] if p.arm == "A" else inputs["fork_h"])
                 parts[p.head_id]["A"].append(a[0].float().cpu())
                 parts[p.head_id]["E"].append(e[0].float().cpu())
         return {hid: {h: torch.cat(v[h]) for h in HEADS} for hid, v in parts.items()}
 
     def evaluate(self, pairs: Sequence[HeadPair], fork: Optional[Fork] = None, best: Optional["BestTracker"] = None,
                  step: Optional[int] = None, slices: Optional[tuple] = None) -> Dict[str, float]:
-        """Every pair's metrics, keys prefixed by the head id (protocol §7.1: e.g. 'A1_lr3e-4/val/xmse_E/hole'),
+        """Every pair's metrics, keys prefixed by the head id (protocol §7.1: e.g. 'A_lr1e-3_p1/val/xmse_E/hole'),
         plus the bank's reference lines (logged as constants, so they draw as flat lines on the same panels) and,
         if a BestTracker is given (full bank only), the '<id>/val/is_best_<h>' flags. The mini-bank defaults to the
-        pooled slice only."""
+        pooled slice and the n bins (MINI_SLICES)."""
         if slices is None and self.mini:
-            slices = ("all",)
+            slices = MINI_SLICES
         preds = self.predict(pairs, fork)
         out: Dict[str, float] = {k: v for k, v in self.refs.items()       # per-slice lines of the kept slices
                                  if slices is None or k.count("/") == 1 or k.rsplit("/", 1)[-1] in slices}
         for p in pairs:
-            m = head_metrics(preds[p.head_id], self.Q, self.refs, self.ref_prefix, self.prefix, slices)
+            m = head_metrics(preds[p.head_id], self.Q, self.refs, self.c, self.ref_prefix, self.prefix, slices)
             out.update({f"{p.head_id}/{k}": v for k, v in m.items()})
             if best is not None:
                 assert not self.mini, "best checkpoints are chosen on the full bank, never the mini-bank"
-                for h, improved in best.update(p.head_id, m, step).items():
+                for h, improved in best.update(p.head_id, m, step, weighted=p.weighted).items():
                     out[f"{p.head_id}/{self.prefix}/is_best_{h}"] = float(improved)
         return out
 
 
 class BestTracker:
-    """Lowest pooled validation MSE per (head pair, head) so far (design Training §3). Resumable."""
+    """Lowest pooled validation MSE per (head pair, head) so far, under the pair's own weighting (module
+    docstring). Resumable."""
 
-    KEY = "val/mse_{h}/all"
+    KEYS = {False: "val/mse_{h}/all", True: "val/wmse_{h}/all"}
 
     def __init__(self):
         self.best: Dict[str, Dict[str, Tuple[float, Optional[int]]]] = {}
 
-    def update(self, head_id: str, metrics: Dict[str, float], step: Optional[int]) -> Dict[str, bool]:
+    def update(self, head_id: str, metrics: Dict[str, float], step: Optional[int], weighted: bool = False
+               ) -> Dict[str, bool]:
         """metrics: the pair's `head_metrics` (unprefixed keys). Returns {"A": improved?, "E": improved?}."""
         cur = self.best.setdefault(head_id, {})
         flags = {}
         for h in HEADS:
-            v = metrics[self.KEY.format(h=h)]
+            v = metrics[self.KEYS[weighted].format(h=h)]
             improved = h not in cur or v < cur[h][0]
             if improved:
                 cur[h] = (v, step)

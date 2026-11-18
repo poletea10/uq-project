@@ -3,7 +3,7 @@
 WHAT IS TESTED
     iltm2.prior._cut_graph_scm   the observed-cut prior: X from graph_scm's X-graph, y = Psi(X_obs, U2) from a
                                  graph_scm-style target graph, exact replicates by redrawing U2 only. Every
-                                 training task, the validation bank and the T2 test bank come from it, so the
+                                 training task and the validation bank come from it, so the
                                  targets t_A, t_E are only exact if this code is.
     iltm2.prior._cached_graph    the cached graph_lib pieces both graphs are built from (only U1 / U2 redrawn)
     iltm2.prior._postprocess     fit/apply versions of tabicl's outlier clamp and standard scaling, and g

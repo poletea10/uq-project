@@ -1,9 +1,12 @@
-"""Step 6 (phase1_protocol.md §3): build the validation bank, the mini-bank and the reference lines.
+"""Step 6 (phase1_protocol.md §3; transfer guide §3.4, §5 Step 2.6): build the validation bank val_bank_v2, the
+mini-bank, the weight floor c and the reference lines.
 
 WHAT
-    The 2,000-task validation bank of design Training §3 (1,000 small / 600 medium / 400 large tasks by N; R_val =
-    128 replicates; its own seed VAL_BANK_SEED), the 64-task mini-bank of protocol §7.4 (the first 64 small tasks),
-    and the reference lines of protocol §8.1 (noise floor, constant baseline, e(q) proxy; per head, per query type
+    The 2,000-task validation bank of transfer guide §3.4 (1,000 small tasks of 256-1,024 rows at 80% context / 600
+    medium / 400 large; carved prior with thinned regions; R_val = 128 replicates; its own seed VAL_BANK_SEED), the
+    64-task mini-bank of protocol §7.4 (the first 64 small tasks), the weight floor c of the p = 1 loss and metrics
+    (fixed at LOSS_C = 0.1, manifest["loss_c"]; transfer guide §3.6), and the reference
+    lines of protocol §8.1 for both weightings (noise floor, constant baseline, e(q) proxy; per head, per query type
     and per n bin). Layout and contents: `iltm2.prior._bank` docstring. Everything the trainer validates against is
     fixed here, once: the targets and e(q_theta) are precomputed with the frozen backbone's forward route.
 
@@ -19,11 +22,13 @@ HOW
     The reference lines are wandb-ready flat {key: float} dicts (`iltm2.train._metrics.reference_lines`):
     manifest["reference_lines"] for the bank and manifest["mini"]["reference_lines"] for the mini-bank (the
     mini-bank uses the bank's constants and the bank's out-of-fold e(q) proxy, as the trainer's heads start from
-    the bank-wide constant). Next: scripts/01b_check_val_bank.sh (the bank checks of protocol §3 step 6).
+    the bank-wide constant). The e(q) quantiles are printed and stored (manifest["e_q_quantiles"]), with the weights'
+    range under c. To change c, relaunch the same command with --loss-c <value>: the shards are kept and only the
+    manifest and the reference lines are rewritten (the same holds when c changes in the code). Next: scripts/01b_check_val_bank.sh (the bank checks of protocol §3 step 6).
 
     sbatch experiment1_uq_heads/scripts/01_make_val_bank.sh
     sbatch experiment1_uq_heads/scripts/01_make_val_bank.sh --n-tasks 8 4 2 \
-        --out /private/groups/ioannidislab/UQ_decoupling_exp/val_bank_smoke          # a smoke build first
+        --out /private/groups/ioannidislab/UQ_decoupling_exp_new/val_bank_v2_smoke          # a smoke build first
 """
 import argparse
 import json
@@ -41,12 +46,12 @@ import torch
 from joblib import Parallel, delayed
 
 from iltm2.model._backbone import DEFAULT_BACKBONE, FrozenBackbone, file_sha256
-from iltm2.prior._bank import (BANK_DIR, BIN_NAMES, BINS, MINI_SIZE, R_VAL, VAL_BANK_SEED, BankQueries,
+from iltm2.prior._bank import (BANK_DIR, BIN_NAMES, BINS, LOSS_C, MINI_SIZE, R_VAL, VAL_BANK_SEED, BankQueries,
                                atomic_save, config_dict, forecast_targets, generate_bank_task, shard_path,
                                shard_ranges, stream_stats, task_meta, task_offsets)
 from iltm2.prior._cut_graph_scm import CutGraphConfig
 from iltm2.prior._split import QUERY_TYPES
-from iltm2.train._metrics import HEADS, N_BINS, eq_proxy_predictions, reference_lines, targets_of
+from iltm2.train._metrics import HEADS, N_BINS, const_values, proxy_predictions, reference_lines
 
 REPO = Path(__file__).resolve().parents[2]                 # UQ_project
 
@@ -81,6 +86,8 @@ def main():
     ap.add_argument("--n-jobs", type=int, default=max(1, len(os.sched_getaffinity(0)) - 2))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--checkpoint", default=DEFAULT_BACKBONE)
+    ap.add_argument("--loss-c", type=float, default=None,
+                    help=f"the weight floor c (default: the fixed {LOSS_C}, transfer guide §3.6)")
     args = ap.parse_args()
     assert args.R % 2 == 0 and args.R >= 4, "R must be even (half-split targets)"
     n_tasks = dict(zip(BIN_NAMES, args.n_tasks))
@@ -102,7 +109,7 @@ def main():
     else:
         bc_path.write_text(json.dumps(build, indent=2))
 
-    backbone = FrozenBackbone(args.checkpoint, args.device, tap_layers=None)
+    backbone = FrozenBackbone(args.checkpoint, args.device)
     print(f"{backbone!r}\nseed {args.seed}; R {args.R}; tasks {n_tasks}; n_jobs {args.n_jobs}; device "
           f"{torch.cuda.get_device_name() if args.device == 'cuda' else args.device}", flush=True)
     offsets = task_offsets(n_tasks)
@@ -145,15 +152,25 @@ def main():
     assert len(metas) == sum(n_tasks.values()) and Q.task_id.max() == len(metas) - 1
     atomic_save(Q.to_dict(), out / "queries.pt")
 
-    proxy = {h: eq_proxy_predictions(Q.e_q, targets_of(Q, h)[0], Q.task_id) for h in HEADS}
-    refs = reference_lines(Q, eq_proxy=proxy)
-    const = {h: refs[f"ref/const_value_{h}"] for h in HEADS}
+    e_q = Q.e_q.double()
+    eq_quant = {str(p): float(torch.quantile(e_q, p)) for p in (0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)}
+    c_median = float(torch.median(e_q))
+    loss_c = LOSS_C if args.loss_c is None else float(args.loss_c)
+    assert loss_c > 0, f"the weight floor c must be positive, got {loss_c}"
+    det_tasks = torch.tensor([m["deterministic"] for m in metas])
+    det_q = det_tasks[Q.task_id]
+    below = e_q <= loss_c
+    w = 1.0 / (e_q + loss_c)
+    proxy = proxy_predictions(Q, loss_c)
+    const = const_values(Q, loss_c)
+    refs = reference_lines(Q, loss_c, const=const, eq_proxy=proxy)
     mini_mask = Q.task_id < len(mini_tasks)                 # small tasks come first: ids 0..63
     Qm = Q.subset(mini_mask)
     (out / "mini").mkdir(exist_ok=True)
     atomic_save(mini_tasks, out / "mini" / "tasks.pt")
     atomic_save(Qm.to_dict(), out / "mini" / "queries.pt")
-    mini_refs = reference_lines(Qm, const=const, eq_proxy={h: proxy[h][mini_mask] for h in HEADS}, prefix="ref_mini")
+    mini_refs = reference_lines(Qm, loss_c, const=const, eq_proxy={k: v[mini_mask] for k, v in proxy.items()},
+                                prefix="ref_mini")
 
     qt = torch.bincount(Q.query_type.long(), minlength=len(QUERY_TYPES)).double()
     nb = torch.bincount(Q.n_bin.long(), minlength=len(N_BINS))
@@ -165,6 +182,13 @@ def main():
         query_type_share={QUERY_TYPES[c]: float(qt[c] / qt.sum()) for c in QUERY_TYPES},
         n_bin_counts={N_BINS[i][0]: int(nb[i]) for i in range(len(N_BINS))},
         prior_config=config_dict(cfg), dup_fraction=cfg.dup_fraction, query_mix=cfg.query_mix,
+        loss_c=loss_c, loss_c_rule=f"fixed ({LOSS_C}, transfer guide §3.6)" if args.loss_c is None else "--loss-c",
+        e_q_median=c_median, e_q_quantiles=eq_quant,
+        e_q_below_c=dict(share_of_queries=float(below.double().mean()),
+                         share_from_deterministic_tasks=float(det_q[below].double().mean()),
+                         share_t_A_zero=float((Q.t_A[below] == 0).double().mean())),
+        weights=dict(max=float(1.0 / loss_c), quantiles={str(p): float(torch.quantile(w, p))
+                                                       for p in (0.01, 0.25, 0.5, 0.75, 0.99)}),
         backbone=dict(path=args.checkpoint, sha256=sha, forward_route="FrozenBackbone (training-mode, fp32 SDPA)"),
         git=dict(UQ_project=git_state(REPO), tabicl=git_state(REPO / "external" / "tabicl")),
         software=dict(torch=torch.__version__, python=platform.python_version(),
@@ -185,10 +209,20 @@ def main():
     s = manifest["stream"]["all"]
     print(f"stream: rejection rate {s['rejection_rate']:.1%} {s['rejected']}; redraws {s['redraws']}; deterministic "
           f"tasks {s['deterministic_share']:.1%}; t_A zero mass {s['tA_zero_mass']:.1%}")
+    for reg, d in s["thinning"].items():
+        print(f"thinning {reg}: {d['thinned_share']:.1%} of {d['tasks_with_free_rows']} regions thinned; realized rho "
+              f"{d['rho_quantiles']}")
+    print("e(q) quantiles: " + " ".join(f"q{float(p) * 100:g}={v:.4g}" for p, v in eq_quant.items()))
+    b = manifest["e_q_below_c"]
+    print(f"weight floor c = {loss_c:.4g} ({manifest['loss_c_rule']}; median e(q) {c_median:.4g}); {b['share_of_queries']:.1%} "
+          f"of the queries have e(q) <= c, {b['share_from_deterministic_tasks']:.1%} of them from deterministic tasks, "
+          f"{b['share_t_A_zero']:.1%} with t_A = 0; weights w = 1/(e(q) + c): max {1 / loss_c:.3g}, quantiles "
+          + " ".join(f"q{float(p) * 100:g}={v:.3g}" for p, v in manifest["weights"]["quantiles"].items()))
     for h in HEADS:
-        print(f"reference lines {h} (pooled): noise floor {refs[f'ref/noise_floor_{h}/all']:.4g}, const xMSE "
-              f"{refs[f'ref/const_xmse_{h}/all']:.4g}, e(q) proxy xMSE {refs[f'ref/eq_proxy_xmse_{h}/all']:.4g} "
-              f"(skill {refs[f'ref/eq_proxy_skill_{h}/all']:.3f})")
+        for pre, name in (("", "unweighted"), ("w", "weighted")):
+            print(f"reference lines {h} {name} (pooled): noise floor {refs[f'ref/{pre}noise_floor_{h}/all']:.4g}, "
+                  f"const xMSE {refs[f'ref/{pre}const_xmse_{h}/all']:.4g}, e(q) proxy xMSE "
+                  f"{refs[f'ref/{pre}eq_proxy_xmse_{h}/all']:.4g} (skill {refs[f'ref/{pre}eq_proxy_skill_{h}/all']:.3f})")
     print(f"wrote {out} in {(time.time() - t0) / 60:.1f} min", flush=True)
 
 

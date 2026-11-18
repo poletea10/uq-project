@@ -1,20 +1,23 @@
 """Shared trainer skeleton of Phase 1 (phase1_protocol.md §1.3, §2, §7; design Training §2-3, §5).
 
 `BaseTrainer.run()` trains ONE stage of one job. The arm-specific trainers (`frozen.FrozenTrainer` for the A jobs,
-`fork.ForkTrainer` for B in step 9) supply the model, the optimizers and the step; this class owns the stage logic,
+`fork.ForkTrainer` for the B jobs) supply the model, the optimizers and the step; this class owns the stage logic,
 copied from tabicl's `Trainer.train` loop (Timer, prior_time / train_time, latest + permanent checkpoints, the
 only-load-model restart of scripts/train_v2_reg_stage2.sh) without its DDP / AMP / Muon machinery.
 
-FILES (protocol §2), under <runs_root>/<run_name>/
+FILES (protocol §2), under <runs_root>/<run_name>/ (runs_root: <iltm2.paths.ROOT>/runs)
     stage<s>/latest.pt      full state (heads, optimizers, schedulers, EMAs, best tracker, step), overwritten
                             every --save_temp_every steps and after every full validation
     stage<s>/final.pt       written ONCE at the end of stage s, never overwritten (a second write is an error):
                             the stage's result, kept when the next stage runs
-    stage<s>/best/<id>_<h>.pt   the best head h of pair <id> so far (lowest pooled full-bank validation MSE),
-                            written in the stage where it was reached
+    stage<s>/best/<id>_<h>.pt   the best head h of pair <id> so far (lowest pooled full-bank validation MSE under
+                            the pair's own weighting), written in the stage where it was reached
     best_index.json         where each head's current best lives (stage, global step, val MSE, path)
     stage<s>/trace.jsonl    one line per step: stage step, global step, LR per pair, batch fingerprint, launch id
-    stage<s>/summary.json   timings (prior wait, train, validation), peak GPU memory, projected stage wall time
+    stage<s>/summary.json   timings (prior wait, train, validation, input caches), peak GPU memory, projected stage
+                            wall time
+    stage<s>/last_{train,mini,val}.json   the last logged training step, mini-bank and full-bank metrics (flat
+                            {key: float}, the wandb keys), so a run can be checked without the wandb API
 
 HOW A STAGE STARTS (so a relaunched job always does the right thing)
     1. stage<s>/final.pt exists      -> the stage is done: exit 0 at once (a resubmitted job skips it)
@@ -23,11 +26,13 @@ HOW A STAGE STARTS (so a relaunched job always does the right thing)
                                         only; optimizers and schedulers start fresh (tabicl's --only_load_model):
                                         new max LR, 1% warmup, one cosine cycle (design Training §2)
     4. s = 1                         -> fresh heads; output biases from the first batch's mean targets (design §1)
-                                        or the bank's constants (--init_bias bank)
+                                        or the bank's constants (--init_bias bank), weighted for p > 0 pairs: each
+                                        pair starts at the best constant under its own loss
     Global (wandb) step = previous stage's final global step + stage step, so curves are continuous (§7.1).
 
-PER STEP: train_step on the step's micro-batch groups (the task stream of `iltm2.prior._dataset`, delivered out of
-order and put back in step order), then: wandb log every --log_every steps; mini-bank every --mini_every steps;
+PER STEP: train_step on the step's micro-batch groups (the task stream of `iltm2.prior._dataset` for --prior,
+delivered out of order and put back in step order; in stage 1 each group carries its subsampled pass in `.sub`),
+then: wandb log every --log_every steps; mini-bank every --mini_every steps;
 full bank every --val_every steps and always at the stage end (best-per-head checkpoints); latest.pt every
 --save_temp_every steps. --stop_after n stops the launch after n steps with latest.pt saved, as a killed job would
 (the smoke run's resume test).
@@ -50,7 +55,7 @@ from tabicl.train._run import Timer
 
 from iltm2.prior._bank import atomic_save, load_manifest
 from iltm2.prior._dataset import CutGraphPrior, UQBatch, iterate_steps, make_dataloader
-from iltm2.train._config import STAGE_STEPS
+from iltm2.train._config import STAGE_STEPS, VAL_EVERY
 from iltm2.train._validate import BankEvaluator, BestTracker
 
 REPO = Path(__file__).resolve().parents[4]            # UQ_project
@@ -74,11 +79,12 @@ def file_sha256(path) -> str:
 
 
 def batch_fingerprint(g: UQBatch) -> str:
-    """Short hash of a group's context labels and replicates: the same step gives the same fingerprint in every
-    launch (used by the smoke run's resume check)."""
+    """Short hash of a group's context labels and replicates, of every pass (full and, in stage 1, subsampled): the
+    same step gives the same fingerprint in every launch (used by the smoke run's resume check)."""
     h = hashlib.sha256()
-    for t in (g.y_ctx, g.y_reps):
-        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    for gp in g.passes:
+        for t in (gp.y_ctx, gp.y_reps):
+            h.update(t.detach().cpu().contiguous().numpy().tobytes())
     return h.hexdigest()[:16]
 
 
@@ -110,7 +116,8 @@ class BaseTrainer:
         self.init_from: Optional[str] = None
         self.wandb = None
         self.launch_id = f"{int(time.time())}-{os.getpid()}"
-        self.timing: Dict[str, List[float]] = dict(prior=[], train=[], val_full=[], val_mini=[])
+        self.timing: Dict[str, List[float]] = dict(prior=[], train=[], val_full=[], val_mini=[], caches=[])
+        self.loss_c: Optional[float] = None     # the weight floor c of p > 0 pairs (`resolve_loss_c`)
         self.rejections = dict(accepted=0, rejected=0)
 
     # ----- hooks (subclasses)
@@ -137,10 +144,11 @@ class BaseTrainer:
     def load_extra_state(self, d: dict):
         pass
 
-    def init_output_bias(self, mean_t_A: float, mean_t_E: float):
+    def init_output_bias(self, consts: Dict[str, float]):
+        """consts: {"A", "E"} unweighted and {"wA", "wE"} weighted mean targets (`warmup_means`)."""
         raise NotImplementedError
 
-    def warmup_means(self, groups: List[UQBatch]) -> Tuple[float, float]:
+    def warmup_means(self, groups: List[UQBatch]) -> Dict[str, float]:
         raise NotImplementedError
 
     def train_step(self, groups: List[UQBatch]) -> Dict[str, float]:
@@ -166,6 +174,12 @@ class BaseTrainer:
 
     def overfit(self) -> bool:
         raise NotImplementedError
+
+    def resolve_loss_c(self) -> float:
+        """c of w = (e(q) + c)^-p: --loss_c if given, else the validation bank's manifest["loss_c"]."""
+        a = self.args
+        self.loss_c = float(a.loss_c) if a.loss_c is not None else float(load_manifest(a.val_bank)["loss_c"])
+        return self.loss_c
 
     # ----- checkpoints
 
@@ -220,6 +234,12 @@ class BaseTrainer:
         if self.wandb is not None:
             self.wandb.log(d, step=gstep)
 
+    def _write_last(self, kind: str, logs: Dict[str, float], gstep: int):
+        path = self.files.dir / f"last_{kind}.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(dict(global_step=gstep, logs=logs)))
+        os.replace(tmp, path)
+
     def _trace(self, rec: dict):
         with open(self.files.trace, "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -235,17 +255,22 @@ class BaseTrainer:
         full = sum(t["val_full"]) / len(t["val_full"]) if t["val_full"] else float("nan")
         mini = sum(t["val_mini"]) / len(t["val_mini"]) if t["val_mini"] else float("nan")
         steps = STAGE_STEPS[a.stage]
-        n_full, n_mini = math.ceil(steps / a.val_every), steps // a.mini_every
-        proj = steps * step_s + n_full * (0 if math.isnan(full) else full) + n_mini * (0 if math.isnan(mini) else mini)
+        val_every = VAL_EVERY[a.stage]
+        caches = sum(t["caches"])
+        n_full, n_mini = math.ceil(steps / val_every), steps // a.mini_every
+        proj = (steps * step_s + n_full * (0 if math.isnan(full) else full) + n_mini * (0 if math.isnan(mini) else mini)
+                + caches)
         peak = torch.cuda.max_memory_allocated() / 2 ** 30 if self.device.type == "cuda" else float("nan")
         out = dict(stage=a.stage, finished=finished, steps_done=self.step, max_steps=a.max_steps,
                    global_step=self.global_offset + self.step, launch=self.launch_id, init_from=self.init_from,
                    median_prior_wait_s=median(prior) if prior else float("nan"),
                    median_train_s=median(train) if train else float("nan"), median_step_s=step_s,
-                   full_val_s=full, mini_val_s=mini, n_full_val=len(t["val_full"]), peak_gpu_gb=peak,
+                   full_val_s=full, mini_val_s=mini, n_full_val=len(t["val_full"]), cache_build_s=caches,
+                   peak_gpu_gb=peak,
                    rejection_rate=self.rejections["rejected"] / max(1, sum(self.rejections.values())),
                    projected_hours_at_design_budget=proj / 3600, design_steps=steps,
-                   val_bank=a.val_bank, batch_size=a.batch_size, num_workers=a.num_workers)
+                   val_bank=a.val_bank, batch_size=a.batch_size, num_workers=a.num_workers, prior=a.prior,
+                   subsample=a.subsample, loss_c=self.loss_c)
         if finished and self.files.final.exists():
             out["final_sha256"] = file_sha256(self.files.final)
         return out
@@ -269,6 +294,7 @@ class BaseTrainer:
             out.update(self.mini_extra_logs())
         out[f"time/{'val' if full else 'mini'}_s"] = t.elapsed
         self.log(out, gstep)
+        self._write_last("val" if full else "mini", out, gstep)
         print(f"  [{'val ' if full else 'mini'}] global step {gstep}: {t.elapsed:.1f}s", flush=True)
 
     # ----- the stage
@@ -279,6 +305,7 @@ class BaseTrainer:
         if a.overfit_steps > 0:
             self.build()
             return 0 if self.overfit() else 1
+        self.resolve_loss_c()
         if self.files.final.exists():
             print(f"{self.files.final} exists: stage {a.stage} of {a.run_name} is complete, nothing to do", flush=True)
             return 0
@@ -309,7 +336,8 @@ class BaseTrainer:
         else:
             if a.init_bias == "bank":
                 refs = load_manifest(a.val_bank)["reference_lines"]
-                self.init_output_bias(refs["ref/const_value_A"], refs["ref/const_value_E"])
+                self.init_output_bias({k: refs[f"ref/{pre}const_value_{h}"] for pre in ("", "w") for h in "AE"
+                                       for k in (f"{pre}{h}",)})
             else:
                 init_bias_pending = True
             print(f"stage 1 of {a.run_name}: fresh heads (seed {a.seed}), output bias from "
@@ -318,11 +346,15 @@ class BaseTrainer:
         if fresh:
             self.preflight()
         self._init_wandb()
-        full_ev, mini_ev = self.build_evaluators()
+        with Timer() as tc:
+            full_ev, mini_ev = self.build_evaluators()
+        self.timing["caches"].append(tc.elapsed)
+        print(f"evaluators ready in {tc.elapsed / 60:.1f} min (input caches: full bank {sorted(full_ev.cache)}, "
+              f"mini-bank {sorted(mini_ev.cache)}); weight floor c = {self.loss_c:.4g}", flush=True)
 
         if self.step < a.max_steps:
             prior = CutGraphPrior(a.seed, a.stage, a.max_steps, start_step=self.step, R=a.R,
-                                  batch_size=a.batch_size)
+                                  batch_size=a.batch_size, prior=a.prior, subsample=a.subsample)
             loader = make_dataloader(prior, a.num_workers, a.prefetch_factor)
             steps = iterate_steps(loader)
             n_launch = 0
@@ -337,7 +369,7 @@ class BaseTrainer:
                 if fresh and step == 0:
                     self.check_first_batch(groups)
                 if init_bias_pending:
-                    self.init_output_bias(*self.warmup_means(groups))
+                    self.init_output_bias(self.warmup_means(groups))
                     init_bias_pending = False
                 fp = batch_fingerprint(groups[0])
                 lrs = self.lrs()
@@ -358,6 +390,8 @@ class BaseTrainer:
                                  "prior/deterministic_share": float(torch.cat([g.deterministic for g in groups])
                                                                     .float().mean())})
                     self.log(logs, gstep)
+                    if last or self.step % 100 == 0:
+                        self._write_last("train", logs, gstep)
                 if self.step % 100 == 0 or last or self.step <= 3:
                     print(f"stage {a.stage} step {self.step}/{a.max_steps} (global {gstep}): prior wait "
                           f"{tp.elapsed:.2f}s, train {tt.elapsed:.2f}s", flush=True)

@@ -1,4 +1,5 @@
-"""Step-6 gate (phase1_protocol.md §3 step 6, "Bank checks, before any training"): is the validation bank right?
+"""Step-6 gate (phase1_protocol.md §3 step 6, "Bank checks, before any training"; transfer guide §5 Step 2.6): is the
+validation bank right?
 
 WHY
     Every validation curve, checkpoint choice and arm comparison of Phase 1 is read against this bank. If its
@@ -8,16 +9,23 @@ WHY
 
 CHECKS
     0. Integrity: task and query counts match the manifest; every target finite; t_A >= 0, e(q) >= 0;
-       score = t_A + t_E; query-type shares within 1 point of the design's 66.5 / 14.25 / 14.25 / 5; every n bin
-       populated; the mini-bank is exactly the bank's first 64 small tasks.
+       score = t_A + t_E; query-type shares within 1 point of the design's iid 66.5 / hole (empty + thinned) 14.25 /
+       extrapolation (empty + thinned) 14.25 / duplicate 5, every query type present, and the empty / thinned split
+       of each region reported; every n bin the bank's shapes reach is populated; thinning: r <= 0.04 N per region,
+       and a task's region queries are `_thinned` exactly when its r > 0; the mini-bank is exactly the bank's first
+       64 small tasks.
+    W. The weight floor c (transfer guide §3.6): c = the fixed LOSS_C (0.1) unless set with --loss-c, and the
+       reference lines were computed with it; the e(q) quantiles, the share of the queries at or below c (and how
+       many of them come from deterministic tasks) and the range of the weights are reported.
     1. Reproducibility: --repro-tasks tasks per bin (the first ones) are regenerated from their keys
        (seed, bin, index) and must be bit-identical to the stored tasks (X, y_ctx, replicates, query types), and
        their forecast targets recomputed with the frozen backbone must equal the stored ones (bit-equal, or within
        1e-6). This ties the bank to the code that generates the training stream and to the backbone's forward route.
-    2. Target ordering by query type (protocol §3 step 6): mean t_E ordered duplicate < iid < hole and
-       duplicate < iid < extrapolation, gated on the pooled bank with task-level bootstrap 95% CIs of the
-       differences (each CI must exclude 0 in the right direction); hole vs extrapolation is reported (expected
-       similar, not gated); the same orderings per N bin (small / medium / large) are reported. Also the broken-stream
+    2. Target ordering by query type (protocol §3 step 6; transfer guide §5 Step 2.6): mean t_E ordered
+       duplicate < iid < thinned < empty, for the hole and for the extrapolation tail, gated on the pooled bank with
+       task-level bootstrap 95% CIs of the differences (each CI must exclude 0 in the right direction); hole vs
+       extrapolation is reported (expected similar, not gated); the same orderings per N bin (small / medium /
+       large) are reported. Also the broken-stream
        red flag of protocol §8.3: the mean t_A of duplicates and of i.i.d. queries must agree (CI of the difference
        covers 0), since duplicates copy the x of context rows, which are i.i.d. rows of the same pool.
     3. The frozen PPD is sane on the cut prior (protocol §3 step 6): for every bank task (or --max-gs-tasks per
@@ -33,7 +41,7 @@ OUTPUT
     per-task tables; exit 1 if any check failed.
 
     sbatch experiment1_uq_heads/scripts/01b_check_val_bank.sh
-    sbatch experiment1_uq_heads/scripts/01b_check_val_bank.sh --bank /private/groups/ioannidislab/UQ_decoupling_exp/val_bank_smoke
+    sbatch experiment1_uq_heads/scripts/01b_check_val_bank.sh --bank /private/groups/ioannidislab/UQ_decoupling_exp_new/val_bank_v2_smoke
 """
 import argparse
 import json
@@ -49,15 +57,21 @@ from joblib import Parallel, delayed
 
 from iltm2.model._backbone import DEFAULT_BACKBONE, FrozenBackbone
 from iltm2.model._entropy import crps
-from iltm2.prior._bank import (BANK_DIR, BIN_NAMES, BINS, MINI_SIZE, forecast_targets, generate_bank_task,
+from iltm2.prior._bank import (BANK_DIR, BIN_NAMES, BINS, LOSS_C, MINI_SIZE, forecast_targets, generate_bank_task,
                                load_manifest, load_queries, shard_path, shard_ranges)
 from iltm2.prior._dataset import STREAM_SPLIT, STREAM_TASK, single_thread, task_rng
 from iltm2.prior._filter import RejectionLog
 from iltm2.prior._graph_scm_ref import graph_scm_task
-from iltm2.prior._split import IID, QUERY_TYPES
+from iltm2.prior._split import EXT, EXT_THIN, HOLE, HOLE_THIN, IID, QUERY_TYPES
+from iltm2.train._metrics import N_BINS
 
 OUT = Path(__file__).resolve().parents[1] / "outputs" / "audits" / "val_bank_checks"
+# Design shares of the query types (query_mix 70 / 15 / 15, then 5% duplicates drawn uniformly over the slots); a
+# region's empty and thinned types share its 14.25%.
 DESIGN_SHARE = {"iid": 0.665, "hole": 0.1425, "extrapolation": 0.1425, "duplicate": 0.05}
+COMBINED = {"iid": ("iid",), "hole": ("hole", "hole_thinned"), "extrapolation": ("extrapolation",
+                                                                                  "extrapolation_thinned"),
+            "duplicate": ("duplicate",)}
 GS_STEP_OFFSET = 100            # graph_scm tasks use task_rng(seed, 100 + bin, index): disjoint from the bank's keys
 FAILS = []
 
@@ -123,20 +137,65 @@ def check_integrity(root, man, Q):
           bool((Q.t_A >= 0).all() and (Q.t_A_a >= 0).all() and (Q.t_A_b >= 0).all() and (Q.e_q >= 0).all()))
     gap = float((Q.score.double() - Q.t_A.double() - Q.t_E.double()).abs().max())
     check("score = t_A + t_E", gap <= 1e-5, f"max |gap| {gap:.1e}")
-    qt = torch.bincount(Q.query_type.long(), minlength=4).double() / len(Q)
+    qt = torch.bincount(Q.query_type.long(), minlength=len(QUERY_TYPES)).double() / len(Q)
     shares = {QUERY_TYPES[c]: float(qt[c]) for c in QUERY_TYPES}
-    check("query-type shares within 1 point of the design",
-          all(abs(shares[k] - DESIGN_SHARE[k]) <= 0.01 for k in DESIGN_SHARE),
+    comb = {k: sum(shares[t] for t in ts) for k, ts in COMBINED.items()}
+    check("query-type shares within 1 point of the design (regions: empty + thinned)",
+          all(abs(comb[k] - DESIGN_SHARE[k]) <= 0.01 for k in DESIGN_SHARE),
+          " ".join(f"{k} {v:.2%}" for k, v in comb.items()))
+    check("every query type is present", all(v > 0 for v in shares.values()),
           " ".join(f"{k} {v:.2%}" for k, v in shares.items()))
+    for reg in ("hole", "extrapolation"):
+        e, t = shares[reg], shares[f"{reg}_thinned"]
+        print(f"      reported: {reg} queries {e / (e + t):.1%} empty / {t / (e + t):.1%} thinned (design: half the "
+              f"regions with non-query rows thinned; regions with none are always empty)")
     nb = torch.bincount(Q.n_bin.long(), minlength=len(man["n_bins"]))
-    check("every n bin is populated", bool((nb > 0).all()),
+    lo_ctx = min(int(BINS[b]["ctx"][0] * BINS[b]["N"][0]) for b in BIN_NAMES)
+    reach = [i for i, (_, lo, hi) in enumerate(N_BINS) if hi >= lo_ctx]
+    check("every n bin the bank's shapes reach is populated", all(int(nb[i]) > 0 for i in reach),
           " ".join(f"{b['name']} {int(c)}" for b, c in zip(man["n_bins"], nb)))
+    metas = []
+    for b, k, _, _ in shard_ranges(n_tasks):
+        metas += torch.load(shard_path(root, b, k), weights_only=False)["meta"]
+    bad_r = [m for m in metas if max(m["r_ext"], m["r_hole"]) > 0.04 * m["N"] + 0.5]
+    check("thinning: r <= 0.04 N in every region", not bad_r, f"{len(bad_r)} tasks above")
+    qt_task = {}
+    for tid, code in zip(Q.task_id.tolist(), Q.query_type.tolist()):
+        qt_task.setdefault(tid, set()).add(code)
+    bad_lab = 0
+    for m in metas:
+        codes = qt_task.get(man["task_offsets"][m["bin"]] + m["index"], set())
+        for r, empty, thin in ((m["r_ext"], EXT, EXT_THIN), (m["r_hole"], HOLE, HOLE_THIN)):
+            bad_lab += (empty in codes) if r > 0 else (thin in codes)
+    check("a region's queries are _thinned exactly when its r > 0", bad_lab == 0, f"{bad_lab} bad regions")
     Qm = load_queries(root, mini=True)
     ref = Q.subset(Q.task_id < man["mini"]["n_tasks"])
     check(f"mini-bank = the bank's first {man['mini']['n_tasks']} small tasks",
           man["mini"]["n_tasks"] == min(MINI_SIZE, n_tasks["small"])
           and all(torch.equal(getattr(Qm, k), getattr(ref, k)) for k in Qm.to_dict()))
     return shares
+
+
+# ------------------------------------------------------------------------------------------- W. the weight floor c
+
+
+def check_loss_c(man, Q):
+    print("\n# W. the weight floor c")
+    c, med = man["loss_c"], float(torch.median(Q.e_q.double()))
+    check("c > 0", c > 0, f"c = {c:.4g}")
+    if man["loss_c_rule"] == "--loss-c":
+        print(f"      reported: c set with --loss-c ({c:.4g}) instead of the fixed {LOSS_C}")
+    else:
+        check(f"c = the fixed {LOSS_C}", c == LOSS_C, f"c {c:.4g}")
+    check("the reference lines were computed with this c", man["reference_lines"].get("ref/loss_c") == c
+          and man["mini"]["reference_lines"].get("ref_mini/loss_c") == c, f"ref/loss_c {man['reference_lines'].get('ref/loss_c')}")
+    print("      e(q) quantiles: " + " ".join(f"q{float(p) * 100:g}={v:.4g}" for p, v in man["e_q_quantiles"].items())
+          + f" (median {med:.4g})")
+    b = man["e_q_below_c"]
+    print(f"      queries with e(q) <= c: {b['share_of_queries']:.1%}, of them {b['share_from_deterministic_tasks']:.1%} "
+          f"from deterministic tasks, {b['share_t_A_zero']:.1%} with t_A = 0; weights: max 1/c = {1 / c:.4g}, "
+          + " ".join(f"q{float(p) * 100:g}={v:.3g}" for p, v in man["weights"]["quantiles"].items()))
+    return dict(loss_c=c, median=med, quantiles=man["e_q_quantiles"], below_c=b, weights=man["weights"])
 
 
 # ------------------------------------------------------------------------------------------- 1. reproducibility
@@ -180,8 +239,10 @@ def check_ordering(man, Q, n_boot):
         tE = type_means_with_boot(Q, Q.t_E, ids, n_boot, seed=1)
         tA = type_means_with_boot(Q, Q.t_A, ids, n_boot, seed=2)
         d = {"iid - duplicate": diff_ci(tE["iid"], tE["duplicate"]),
-             "hole - iid": diff_ci(tE["hole"], tE["iid"]),
-             "extrapolation - iid": diff_ci(tE["extrapolation"], tE["iid"]),
+             "hole_thinned - iid": diff_ci(tE["hole_thinned"], tE["iid"]),
+             "hole - hole_thinned": diff_ci(tE["hole"], tE["hole_thinned"]),
+             "extrapolation_thinned - iid": diff_ci(tE["extrapolation_thinned"], tE["iid"]),
+             "extrapolation - extrapolation_thinned": diff_ci(tE["extrapolation"], tE["extrapolation_thinned"]),
              "hole - extrapolation": diff_ci(tE["hole"], tE["extrapolation"])}
         dA = diff_ci(tA["duplicate"], tA["iid"])
         out[g] = dict(mean_tE={k: v[0] for k, v in tE.items()}, mean_tA={k: v[0] for k, v in tA.items()},
@@ -192,7 +253,8 @@ def check_ordering(man, Q, n_boot):
             print(f"      t_E {k}: {p:+.4g} [{lo_:+.4g}, {hi_:+.4g}]")
         print(f"      t_A duplicate - iid: {dA[0]:+.4g} [{dA[1]:+.4g}, {dA[2]:+.4g}]")
         if g == "all":
-            for k in ("iid - duplicate", "hole - iid", "extrapolation - iid"):
+            for k in ("iid - duplicate", "hole_thinned - iid", "hole - hole_thinned", "extrapolation_thinned - iid",
+                      "extrapolation - extrapolation_thinned"):
                 check(f"pooled: mean t_E {k} > 0 (CI excludes 0)", d[k][1] > 0,
                       f"{d[k][0]:+.4g} [{d[k][1]:+.4g}, {d[k][2]:+.4g}]")
             check("pooled: mean t_A duplicate = iid (CI of the difference covers 0; protocol §8.3)",
@@ -285,7 +347,7 @@ def main():
     man, Q = load_manifest(args.bank), load_queries(args.bank)
     out_dir = OUT / args.bank.name
     out_dir.mkdir(parents=True, exist_ok=True)
-    backbone = FrozenBackbone(args.checkpoint, args.device, tap_layers=None)
+    backbone = FrozenBackbone(args.checkpoint, args.device)
     print(f"bank {args.bank} (seed {man['seed']}, {sum(man['n_tasks'].values())} tasks, {len(Q)} queries)\n"
           f"{backbone!r}", flush=True)
     check("backbone sha256 matches the bank's", backbone.sha256 == man["backbone"]["sha256"],
@@ -293,6 +355,7 @@ def main():
 
     summary = dict(bank=str(args.bank), args={k: str(v) for k, v in vars(args).items()})
     summary["query_type_share"] = check_integrity(args.bank, man, Q)
+    summary["loss_c"] = check_loss_c(man, Q)
     repro = check_repro(args.bank, man, backbone, args.repro_tasks)
     repro.to_csv(out_dir / "reproducibility.csv", index=False)
     summary["ordering"] = check_ordering(man, Q, args.n_boot)

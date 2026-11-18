@@ -1,4 +1,4 @@
-"""Step-4 gate (phase1_protocol.md §3): throughput of the training stream, per stage.
+"""Step-4 gate (phase1_protocol.md §3; transfer guide §5 Step 2.5): throughput of the training stream, per stage.
 
 WHY
     The training stream is generated on the fly (protocol §2): every step consumes 32 fresh observed-cut tasks,
@@ -17,8 +17,8 @@ WHY
 WHAT (per stage, default 1 2 3)
     1. Determinism through the DataLoader: the first --det-groups groups built in this process (workers = 0)
        are bit-identical to the same groups delivered out of order by a W-worker DataLoader and put back in order
-       by `iterate_steps` (protocol §4.2: same (seed, step, task_idx) gives the same task whatever the number of
-       workers or the delivery order).
+       by `iterate_steps`, their stage-1 subsampled passes included (protocol §4.2: same (seed, step, task_idx)
+       gives the same task whatever the number of workers or the delivery order).
     2. Throughput, for each W in --workers: `CutGraphPrior` + `make_dataloader` + `iterate_steps`, exactly the
        trainer's code path, over --n-steps steps. Reported:
          steady s/step   (completion of the last step - completion of the first) / (steps - 1): the rate once all
@@ -34,7 +34,8 @@ WHAT (per stage, default 1 2 3)
        and filters (pipeline steps 1-7), split (8-9), replicates (10), with N and P.
     4. Train-time floor (GPU): the frozen TabICLv2 forward (one raw training-mode forward in float32, the forward
        route of design Architecture §1 and TabICLv2's pretraining dtype) on the first --gpu-steps steps of the
-       first W run, micro-batch = group, as the trainer will run it. The heads (~1M parameters each) cost nothing
+       first W run, micro-batch = group, every pass of the group (stage 1: the full and the subsampled context, two
+       forwards per group, transfer guide §3.9), as the trainer will run it. The heads (~1M parameters each) cost nothing
        next to it, so this is a lower bound on an A-job step; arm B adds a backward through k blocks. Peak GPU
        memory is reported.
     Verdict per stage and W: steady prior s/step <= --margin (0.8) * backbone s/step. Since the backbone forward
@@ -67,11 +68,11 @@ from iltm2.prior._dataset import (BATCH_SIZE, GROUP_SIZE, STAGES, STREAM_REPLICA
                                   single_thread, stage_step_key, task_rng)
 from iltm2.prior._filter import RejectionLog
 from iltm2.prior._split import QUERY_TYPES, make_split
+from iltm2.train._config import STAGE_STEPS as DESIGN_STEPS
 from iltm2.train._targets import t_aleatoric
 
 OUT = Path(__file__).resolve().parents[1] / "outputs" / "audits" / "throughput"
 DEFAULT_CKPT = "/private/groups/ioannidislab/ajaras/tabicl-dev/tabicl-regressor-v2-20260212.ckpt"
-DESIGN_STEPS = {1: 50_000, 2: 4_000, 3: 1_000}            # design Training §2
 FAILS = []
 
 
@@ -88,11 +89,13 @@ def q(a, ps=(0.1, 0.5, 0.9)):
 
 
 def same_bits(a, b):
-    """Bitwise equality of two UQBatch groups (NaN-aware, like `_cut_graph_scm._same_bits`)."""
+    """Bitwise equality of two UQBatch groups, every pass (NaN-aware, like `_cut_graph_scm._same_bits`)."""
     def eq(x, y):
         return (x.shape == y.shape and x.dtype == y.dtype
                 and torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)))
-    return all(eq(getattr(a, k), getattr(b, k)) for k in ("X", "y_ctx", "y_reps", "query_type", "d", "task_idx"))
+    pa, pb = a.passes, b.passes
+    return len(pa) == len(pb) and all(eq(getattr(x, k), getattr(y, k)) for x, y in zip(pa, pb)
+                                      for k in ("X", "y_ctx", "y_reps", "query_type", "d", "task_idx"))
 
 
 # ------------------------------------------------------------------------------------------- 2. throughput
@@ -198,18 +201,20 @@ def load_backbone(path, device):
 
 @torch.no_grad()
 def backbone_time(model, stash, device):
-    """Seconds per step of the frozen forward over the stashed groups (micro-batch = group), and peak memory."""
+    """Seconds per step of the frozen forward over every pass of the stashed groups (micro-batch = group), and peak
+    memory."""
     torch.cuda.reset_peak_memory_stats(device)
     first = stash[0].to(device)
     model(first.X, first.y_ctx)                              # warm-up (kernel selection), not timed
     per_step = {}
     for g in stash:
-        X, y = g.X.to(device), g.y_ctx.to(device)
-        torch.cuda.synchronize(device)
-        t0 = time.perf_counter()
-        model(X, y)                                          # d = None, as in v2 training (ignore_d)
-        torch.cuda.synchronize(device)
-        per_step[g.step] = per_step.get(g.step, 0.0) + time.perf_counter() - t0
+        for gp in g.passes:
+            X, y = gp.X.to(device), gp.y_ctx.to(device)
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            model(X, y)                                      # d = None, as in v2 training (ignore_d)
+            torch.cuda.synchronize(device)
+            per_step[g.step] = per_step.get(g.step, 0.0) + time.perf_counter() - t0
     return float(np.mean(list(per_step.values()))), torch.cuda.max_memory_allocated(device) / 2**30
 
 
@@ -290,7 +295,8 @@ def main():
               f"graph resamples {r['graph_resamples']}; redraws (non-finite replicate) {r['redraws']}; "
               f"deterministic tasks {r['deterministic_share']:.1%}; t_A zero mass {r['tA_zero_mass']:.1%}\n"
               f"                 query types " + " ".join(f"{k} {v:.1%}" for k, v in r["query_type_share"].items())
-              + f" (design: iid 66.5 / hole 14.25 / extrapolation 14.25 / duplicate 5); N {r['N_q']}; d {r['d_q']}")
+              + f" (design: iid 66.5 / hole + hole_thinned 14.25 / extrapolation + extrapolation_thinned 14.25 / "
+                f"duplicate 5); N {r['N_q']}; d {r['d_q']}")
 
         # 3. profile
         prof = [profile_task(args.seed, stage, i, prior.cfg, args.R) for i in range(args.profile_tasks)]

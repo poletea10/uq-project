@@ -1,18 +1,27 @@
 """Task-level sampling of the observed-cut prior: RNG, task shapes, one accepted task, and the training stream
-(design Training §1, protocol §1.3, §3 step 4).
+(design Training §1, protocol §1.3, §3 step 4; transfer guide §3.7-3.9).
 
 This module is the dataset side of the prior. It holds what turns (seed, step, task_idx) into one task, and the
 tasks into the batches a trainer consumes:
       task_rng            deterministic global RNG per (seed, step, task_idx, stream)
+      PRIORS, prior_config   the two task priors: "carved" (the design) and "iid" (ablation only)
       STAGES, TaskShape,  pipeline steps 1-3: stage sizes (N, n_ctx, d), query budgets (m_ext, m_hole, m_iid),
-        sample_task_shape region sizes (T, k) and the pool size P
+        sample_task_shape region sizes (T, k), returned rows of thinned regions (r_ext, r_hole) and the pool size P
       sample_task         shape + `CutGraphSCM.sample` (pipeline steps 4-7, in `_cut_graph_scm.py`) under task_rng
       UQTask, sample_uq_task  one training task: sample_task + split + duplicates + R replicates (steps 1-10)
-      UQBatch             one micro-batch group: tasks sharing (N, n_ctx, d), stacked (protocol §1.3)
+      TaskView            what the model sees of a task: the full context, or a subsampled one
+      UQBatch             one micro-batch group: tasks sharing (N, n_ctx, d), stacked (protocol §1.3); in stage 1 it
+                          carries its subsampled pass in `sub`
       CutGraphPrior       map-style Dataset: item i = group i of the stream (step = i // n_groups); mirrors tabicl's
                           `GraphPrior.get_batch` + `PriorDataset`, with a deterministic stream
       LargestFirstSampler, make_dataloader, iterate_steps   dispatch order, the DataLoader (tabicl's settings,
                           out-of-order delivery) and the per-step reorder buffer
+
+THE TWO PRIORS (transfer guide §3.8)
+    carved  the full pipeline: extrapolation tail, kNN hole, thinned regions, duplicates. Every sweep run.
+    iid     the same generator with TabICLv2's plain random split only: query_mix (1, 0, 0) and no duplicates, so
+            T = k = 0 and P = N. Trained only for the best configuration (the carving ablation).
+    Both use the stage-1 subsampled pass, so the ablation isolates the carving. Both are validated on the same bank.
 
 THE TRAINING STREAM (step 4)
     tabicl's `GraphPrior.get_batch` draws a step's datasets (64 in TabICLv2; `BATCH_SIZE` = 32 here, design
@@ -22,36 +31,48 @@ THE TRAINING STREAM (step 4)
     train_v2_reg_stage*.sh) and requires one (seq_len, train_size) per micro-batch (`validate_micro_batch`). The
     same structure is kept here: a step is `n_groups = batch_size / group_size` groups; group g of step s draws its
     (N, n_ctx, d) once (under task_rng(seed, key, g, STREAM_SHAPE)), and each of its tasks draws everything else
-    (T, k, graphs, pool, split, replicates) from its own (seed, key, task_idx) with task_idx = g * group_size + j.
-    `key = stage_step_key(stage, step)` puts the stage into the RNG key, so stage 2's step 0 is not stage 1's.
+    (T, k, thinning, graphs, pool, split, replicates) from its own (seed, key, task_idx) with task_idx = g *
+    group_size + j. `key = stage_step_key(stage, step)` puts the stage into the RNG key, so stage 2's step 0 is not
+    stage 1's.
     One DataLoader item is one group: a stage-3 step is 32 independent single-task items, so its tasks are spread
     over the workers instead of one worker building 32 tasks of up to 60K rows in a row. Nothing depends on the
-    number of workers, so A job s, the B jobs on seed s and a resumed run all see the same tasks.
+    number of workers, so the A job on seed s, the B jobs on seed s and a resumed run all see the same tasks.
     Items are built largest group first and delivered out of order (`make_dataloader`), so that no worker idles
     behind a slow 60K-row task; `iterate_steps` puts them back in stream order (a per-step reorder buffer), so the
     trainer receives exactly the steps an in-order loader would give.
 
+THE SUBSAMPLED PASS IN STAGE 1 (transfer guide §3.9)
+    Stage 1's contexts are 30-90% of 1,024 rows (at least ~307), while the toy set and the real-data tests use 64-256.
+    So in stage 1 every task is used twice in its step: the full pass (the task as built) and a subsampled pass,
+    the same task with its context reduced to n' rows, n' log-uniform in [64, n_ctx]. One n' per micro-batch group
+    (under task_rng(seed, key, group, STREAM_SUB_SIZE)), so the subsampled group still has one (seq_len, train_size);
+    the dropped rows are uniform at random per task (task_rng(seed, key, task_idx, STREAM_SUB_ROWS)). Queries and
+    replicates are unchanged, so t_A is identical in both passes; t_E is recomputed by the trainer from the new
+    forecast. Labels: a duplicate whose source row was dropped is relabelled to its source row's type, and a thinned
+    region with no returned row left becomes empty (`_split.subsample_context`). Stages 2-3 have one pass per task.
+
 DETERMINISM
     graph_lib draws from the global numpy and torch RNGs, so `task_rng` seeds them from a `SeedSequence` of
     (seed, step, task_idx, stream) and restores them afterwards. A task is then a pure function of those integers,
-    whatever process or DataLoader worker builds it: A job s and the B jobs on seed s see the same tasks, and a
+    whatever process or DataLoader worker builds it: the A job and the B jobs on seed s see the same tasks, and a
     resumed run continues on exactly the tasks it would have seen (design Training §5, protocol §1.3). Streams keep
-    the stages of a task independent of each other (task, split, replicates).
+    the stages of a task independent of each other (task, split, replicates, subsampling).
 
 TASK SHAPES
     Every task has exactly TabICLv2's sizes for the current stage (scripts/train_v2_reg_stage{1,2,3}.sh): N rows
     the model sees, n_ctx of them context. Hole and extrapolation queries are carved out of regions whose other
-    rows are discarded so that the context never sees them; to keep n_ctx and m = N - n_ctx exact, the X-graph
-    generates an enlarged pool of P = N + (T - m_ext) + (k - m_hole) rows: the N kept rows plus exactly the rows
-    the split will discard (design Training §1, "Fixed sizes").
+    rows are discarded (empty region) or mostly discarded (thinned region: r of them are returned to the context),
+    so that the context never or rarely sees them. To keep n_ctx and m = N - n_ctx exact, the X-graph generates an
+    enlarged pool of P = N + (T - m_ext - r_ext) + (k - m_hole - r_hole) rows: the N kept rows plus exactly the
+    rows the split will discard. All sizes are drawn before generation, so P is known in advance (guide §3.7).
 """
 from __future__ import annotations
 
 import contextlib
 import math
 import time
-from dataclasses import dataclass, field, fields
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from dataclasses import dataclass, field, fields, replace
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import threadpoolctl
@@ -66,9 +87,9 @@ from iltm2.prior._filter import RejectionLog
 
 # =========================================================================================== determinism
 
-# STREAM_SHAPE seeds a micro-batch group's shared (N, n_ctx, d); its task_idx slot holds the group index.
-# Redraws after a non-finite replicate use stream + REDRAW_STRIDE * k (as scripts/00f_difficulty_match.py does).
-STREAM_TASK, STREAM_SPLIT, STREAM_REPLICATES, STREAM_SHAPE = 0, 1, 2, 3
+# STREAM_SHAPE and STREAM_SUB_SIZE seed values shared by a micro-batch group; their task_idx slot holds the group
+# index. Redraws after a non-finite replicate use stream + REDRAW_STRIDE * k (as scripts/00f_difficulty_match.py does).
+STREAM_TASK, STREAM_SPLIT, STREAM_REPLICATES, STREAM_SHAPE, STREAM_SUB_SIZE, STREAM_SUB_ROWS = 0, 1, 2, 3, 4, 5
 REDRAW_STRIDE = 100
 
 
@@ -79,10 +100,12 @@ def task_rng(seed: int, step: int, task_idx: int, stream: int = STREAM_TASK):
     graph_lib draws from the *global* numpy and torch RNGs (and each `Context` seeds its `GlobalSampler` from the
     global numpy RNG), so seeding them makes a task a pure function of the four integers, whatever process or
     DataLoader worker builds it (protocol §1.3). The streams keep stages of a task independent:
-      STREAM_TASK        task shape, both graphs, pool and y^(0) (`sample_task`)
-      STREAM_SPLIT       hole / tail / i.i.d. split and duplicates (step 3, `_split.py`)
+      STREAM_TASK        task shape (incl. thinning), both graphs, pool and y^(0) (`sample_task`)
+      STREAM_SPLIT       hole / tail / i.i.d. split, returned rows and duplicates (step 3, `_split.py`)
       STREAM_REPLICATES  the R replicate draws (`CutGraphTask.replicates`)
       STREAM_SHAPE       a micro-batch group's shared (N, n_ctx, d); task_idx is then the group index
+      STREAM_SUB_SIZE    a group's subsampled context size n' (stage 1); task_idx is the group index
+      STREAM_SUB_ROWS    which context rows a task keeps in the subsampled pass
     Bit-identical results across processes also need the same intra-op thread count (torch reductions may sum in
     a different order); DataLoader workers use 1 thread, and the determinism test sets 1 thread everywhere.
     Python's `set` iteration order (PYTHONHASHSEED) is not involved here: this module never iterates a set.
@@ -96,6 +119,19 @@ def task_rng(seed: int, step: int, task_idx: int, stream: int = STREAM_TASK):
     finally:
         np.random.set_state(np_state)
         torch.set_rng_state(torch_state)
+
+
+# =========================================================================================== the two priors
+
+PRIORS = ("carved", "iid")
+
+
+def prior_config(prior: str = "carved", cfg: Optional[CutGraphConfig] = None) -> CutGraphConfig:
+    """The `CutGraphConfig` of a task prior (module docstring, THE TWO PRIORS). "iid" keeps every generator setting
+    and removes the carving: no tail, no hole (so no thinning) and no duplicates."""
+    assert prior in PRIORS, f"prior must be one of {PRIORS}, got {prior!r}"
+    cfg = cfg or CutGraphConfig()
+    return cfg if prior == "carved" else replace(cfg, query_mix=(1.0, 0.0, 0.0), dup_fraction=0.0)
 
 
 # =========================================================================================== task shape [1-3]
@@ -115,12 +151,13 @@ def _round(x: float) -> int:
 
 @dataclass(frozen=True)
 class TaskShape:
-    """Sizes of one task (design Training §1, "Fixed sizes" and pipeline steps 1-3).
+    """Sizes of one task (design Training §1, "Fixed sizes" and pipeline steps 1-3; transfer guide §3.7).
 
     The model sees N = n_ctx + m rows. The m queries split into m_ext extrapolation, m_hole hole and m_iid i.i.d.
-    queries. The tail (T rows) and the hole (k rows) are carved out of an enlarged pool; their rows that are not
-    selected as queries are discarded, so the context never sees those regions. The pool therefore has
-    P = N + (T - m_ext) + (k - m_hole) rows: the N kept rows plus exactly the rows that will be discarded.
+    queries. The tail (T rows) and the hole (k rows) are carved out of an enlarged pool. Of a region's non-query
+    rows, r are returned to the context (r = 0: the region is empty; r > 0: thinned) and the rest are discarded.
+    The pool therefore has P = N + (T - m_ext - r_ext) + (k - m_hole - r_hole) rows: the N kept rows plus exactly
+    the rows that will be discarded. The i.i.d. remainder supplies n_ctx - r_ext - r_hole context rows.
     """
     stage: int
     N: int
@@ -131,6 +168,8 @@ class TaskShape:
     m_iid: int
     T: int
     k: int
+    r_ext: int = 0
+    r_hole: int = 0
 
     @property
     def m(self) -> int:
@@ -138,7 +177,17 @@ class TaskShape:
 
     @property
     def P(self) -> int:
-        return self.N + (self.T - self.m_ext) + (self.k - self.m_hole)
+        return self.N + (self.T - self.m_ext - self.r_ext) + (self.k - self.m_hole - self.r_hole)
+
+    @property
+    def rho_ext(self) -> float:
+        """Realized share of the tail's non-query rows returned to the context (0 for an empty tail)."""
+        return self.r_ext / (self.T - self.m_ext) if self.T > self.m_ext else 0.0
+
+    @property
+    def rho_hole(self) -> float:
+        """Realized share of the hole's non-query rows returned to the context (0 for an empty hole)."""
+        return self.r_hole / (self.k - self.m_hole) if self.k > self.m_hole else 0.0
 
 
 def _log_uniform_int(lo: int, hi: float) -> int:
@@ -151,6 +200,21 @@ def _log_uniform_int(lo: int, hi: float) -> int:
     return int(np.clip(_round(math.exp(np.random.uniform(math.log(lo), math.log(hi)))), lo, hi))
 
 
+def _returned_rows(n_free: int, cfg: CutGraphConfig) -> int:
+    """r for one carved region with n_free non-query rows (transfer guide §3.7): 0 (empty) with probability
+    thin_empty_prob, else max(1, round(rho n_free)) with rho log-uniform in thin_rho_range. A thinned region returns
+    at least one row, so a region with non-query rows is empty or thinned with exactly these probabilities (the tail
+    and the hole draw independently: 1/4 each of both empty, tail thinned, hole thinned, both thinned). Only a
+    region with no non-query row (T = m) is always empty; it draws nothing."""
+    if n_free <= 0:
+        return 0
+    if np.random.uniform() < cfg.thin_empty_prob:
+        return 0
+    lo, hi = cfg.thin_rho_range
+    rho = math.exp(np.random.uniform(math.log(lo), math.log(hi)))
+    return min(n_free, max(1, _round(rho * n_free)))
+
+
 def sample_task_shape(stage: int, cfg: CutGraphConfig, N: Optional[int] = None, n_ctx: Optional[int] = None,
                       d: Optional[int] = None) -> TaskShape:
     """Pipeline steps 1-3. N, n_ctx and d follow TabICLv2's own samplers unless given (the gate matches them).
@@ -159,7 +223,9 @@ def sample_task_shape(stage: int, cfg: CutGraphConfig, N: Optional[int] = None, 
        (TabICLv2 truncates f N to an int). d: uniform on [min_features, `Prior.adjust_max_features(N)`], rounded,
        as `GraphPrior.get_batch` does for each subgroup.
     2. Query budgets from the mixture: m_ext = round(p_extrap m), m_hole = round(p_hole m), m_iid = the rest.
-    3. Region sizes: T ~ log-uniform [m_ext, max(m_ext, 0.2 N)], k ~ log-uniform [m_hole, max(m_hole, 0.2 N)].
+    3. Region sizes: T ~ log-uniform [m_ext, max(m_ext, 0.2 N)], k ~ log-uniform [m_hole, max(m_hole, 0.2 N)];
+       then the returned rows r_ext (tail) and r_hole (hole), drawn independently (`_returned_rows`). With
+       region_max_frac 0.2 and rho <= 0.2, r <= 0.04 N per region (or r = 1), far below the smallest context.
     """
     st = STAGES[stage]
     if N is None:
@@ -175,7 +241,10 @@ def sample_task_shape(stage: int, cfg: CutGraphConfig, N: Optional[int] = None, 
     assert m_iid >= 0 and 0 < n_ctx < N and d >= 1
     T = _log_uniform_int(m_ext, cfg.region_max_frac * N)
     k = _log_uniform_int(m_hole, cfg.region_max_frac * N)
-    return TaskShape(stage, N, n_ctx, d, m_ext, m_hole, m_iid, T, k)
+    r_ext = _returned_rows(T - m_ext, cfg)
+    r_hole = _returned_rows(k - m_hole, cfg)
+    assert r_ext + r_hole < n_ctx, "the i.i.d. remainder must supply at least one context row"
+    return TaskShape(stage, N, n_ctx, d, m_ext, m_hole, m_iid, T, k, r_ext, r_hole)
 
 
 def sample_task(seed: int, step: int, task_idx: int, stage: int, cfg: Optional[CutGraphConfig] = None,
@@ -189,6 +258,18 @@ def sample_task(seed: int, step: int, task_idx: int, stage: int, cfg: Optional[C
 
 
 # =========================================================================================== one training task [1-10]
+
+
+@dataclass
+class TaskView:
+    """What the model sees of one task: X (N', d) context rows first, y_ctx (n', ) context labels, Y (m, R) the
+    replicates of the query slots, query_type (m,), and whether the task is deterministic. The full pass has
+    N' = N and n' = n_ctx; the subsampled pass keeps n' < n_ctx context rows and every query."""
+    X: torch.Tensor
+    y_ctx: torch.Tensor
+    Y: torch.Tensor
+    query_type: torch.Tensor
+    deterministic: bool
 
 
 @dataclass
@@ -219,6 +300,20 @@ class UQTask:
     def deterministic(self) -> bool:
         """True if no private root reaches y: y is an exact function of X and t_A = 0 at every query."""
         return self.task.target.n_private_roots_used == 0
+
+    def view(self) -> TaskView:
+        """The full pass: the task as built."""
+        return TaskView(self.X_model, self.y_ctx, self.Y, self.split.query_type, self.deterministic)
+
+    def subsampled(self, n_sub: int) -> TaskView:
+        """The subsampled pass: n_sub of the n_ctx context rows, uniform at random (relative order kept), every
+        query and its replicates unchanged, query types relabelled (`_split.subsample_context`). Call it inside
+        task_rng(seed, key, task_idx, STREAM_SUB_ROWS)."""
+        from iltm2.prior._split import subsample_context
+        keep, qt = subsample_context(self.split, n_sub)
+        ctx = self.split.ctx_rows[keep]
+        X = self.task.X[torch.cat([ctx, self.split.query_rows])]
+        return TaskView(X, self.task.y0[ctx], self.Y, qt, self.deterministic)
 
 
 def sample_uq_task(seed: int, step: int, task_idx: int, stage: int, cfg: Optional[CutGraphConfig] = None,
@@ -260,8 +355,10 @@ def sample_uq_task(seed: int, step: int, task_idx: int, stage: int, cfg: Optiona
 BATCH_SIZE = 32
 # Tasks per micro-batch group (tabicl `--batch_size_per_gp` = `--micro_batch_size`, scripts/train_v2_reg_stage*.sh).
 GROUP_SIZE = {1: 4, 2: 1, 3: 1}
-# Stage 1 runs 50K steps (design Training §2); any offset above the longest stage keeps the stages' keys disjoint.
+# Any offset above the longest stage (30,000 steps) keeps the stages' keys disjoint.
 STAGE_KEY_OFFSET = 10_000_000
+# Smallest subsampled context (transfer guide §3.9: the toy set and the real-data tests go down to 64 rows).
+SUB_MIN_CTX = 64
 
 
 def stage_step_key(stage: int, step: int) -> int:
@@ -276,6 +373,12 @@ def sample_group_shape(seed: int, key: int, group: int, stage: int, cfg: CutGrap
     with task_rng(seed, key, group, STREAM_SHAPE):
         s = sample_task_shape(stage, cfg)
     return s.N, s.n_ctx, s.d
+
+
+def sample_sub_size(seed: int, key: int, group: int, n_ctx: int) -> int:
+    """n' of a group's subsampled pass: log-uniform integer in [64, n_ctx] (transfer guide §3.9)."""
+    with task_rng(seed, key, group, STREAM_SUB_SIZE):
+        return _log_uniform_int(min(SUB_MIN_CTX, n_ctx), n_ctx)
 
 
 @contextlib.contextmanager
@@ -300,14 +403,16 @@ class UQBatch:
                                         padding (tabicl pads to max_features and truncates to max(d))
     y_ctx        (B, n_ctx)    float32  context labels g(y^(0))
     y_reps       (B, m, R)     float32  g-transformed replicates of the query slots: the heads' targets
-    query_type   (B, m)        long     IID / HOLE / EXT / DUP (`_split.QUERY_TYPES`)
+    query_type   (B, m)        long     `_split.QUERY_TYPES` codes
     d            (B,)          long     active features per task (after dropping constant columns)
-    seq_len, train_size        int      N and n_ctx
+    seq_len, train_size        int      N and n_ctx (of this pass)
     stage, step, group         int      where the group sits in the stream (step is stage-local)
     task_idx     (B,)          long     task index within the step
     deterministic (B,)         bool     no private root reaches y (t_A = 0 at every query)
     log                                 the group's RejectionLog (rejections and redraws behind its B tasks)
     gen_time                   float    seconds spent building the group (in its DataLoader worker)
+    subsampled                 bool     True for a subsampled pass
+    sub                                 stage 1: the same tasks' subsampled pass (a UQBatch), else None
     """
     X: torch.Tensor
     y_ctx: torch.Tensor
@@ -323,6 +428,8 @@ class UQBatch:
     deterministic: torch.Tensor
     log: RejectionLog = field(default_factory=RejectionLog)
     gen_time: float = 0.0
+    subsampled: bool = False
+    sub: Optional["UQBatch"] = None
 
     @property
     def B(self) -> int:
@@ -336,11 +443,20 @@ class UQBatch:
     def R(self) -> int:
         return self.y_reps.shape[-1]
 
+    @property
+    def passes(self) -> List["UQBatch"]:
+        """[this group] or, in stage 1, [this group, its subsampled pass]: what the trainer runs forwards on."""
+        return [self] if self.sub is None else [self, self.sub]
+
     def _map(self, fn) -> "UQBatch":
         kw = {}
         for f in fields(self):
             v = getattr(self, f.name)
-            kw[f.name] = fn(v) if isinstance(v, torch.Tensor) else v
+            if isinstance(v, torch.Tensor):
+                v = fn(v)
+            elif isinstance(v, UQBatch):
+                v = v._map(fn)
+            kw[f.name] = v
         return UQBatch(**kw)
 
     def pin_memory(self) -> "UQBatch":
@@ -351,20 +467,22 @@ class UQBatch:
         return self._map(lambda t: t.to(device, non_blocking=non_blocking))
 
     @classmethod
-    def stack(cls, tasks: List[UQTask], stage: int, step: int, group: int, task_idx: List[int],
-              log: RejectionLog, gen_time: float) -> "UQBatch":
-        N, n_ctx = tasks[0].task.shape.N, tasks[0].task.shape.n_ctx
-        assert all(t.task.shape.N == N and t.task.shape.n_ctx == n_ctx for t in tasks), "one shape per group"
-        d = torch.tensor([t.task.X.shape[1] for t in tasks], dtype=torch.long)
-        X = torch.zeros(len(tasks), N, int(d.max()), dtype=torch.float32)
-        for b, t in enumerate(tasks):
-            X[b, :, :int(d[b])] = t.X_model.float()
-        return cls(X=X, y_ctx=torch.stack([t.y_ctx.float() for t in tasks]),
-                   y_reps=torch.stack([t.Y.float() for t in tasks]),
-                   query_type=torch.stack([t.split.query_type.long() for t in tasks]), d=d,
+    def stack(cls, tasks: List[Union[UQTask, TaskView]], stage: int, step: int, group: int, task_idx: List[int],
+              log: RejectionLog, gen_time: float, subsampled: bool = False) -> "UQBatch":
+        views = [t.view() if isinstance(t, UQTask) else t for t in tasks]
+        N, n_ctx = views[0].X.shape[0], views[0].y_ctx.shape[0]
+        assert all(v.X.shape[0] == N and v.y_ctx.shape[0] == n_ctx for v in views), "one shape per group"
+        d = torch.tensor([v.X.shape[1] for v in views], dtype=torch.long)
+        X = torch.zeros(len(views), N, int(d.max()), dtype=torch.float32)
+        for b, v in enumerate(views):
+            X[b, :, :int(d[b])] = v.X.float()
+        return cls(X=X, y_ctx=torch.stack([v.y_ctx.float() for v in views]),
+                   y_reps=torch.stack([v.Y.float() for v in views]),
+                   query_type=torch.stack([v.query_type.long() for v in views]), d=d,
                    seq_len=N, train_size=n_ctx, stage=stage, step=step, group=group,
                    task_idx=torch.tensor(task_idx, dtype=torch.long),
-                   deterministic=torch.tensor([t.deterministic for t in tasks]), log=log, gen_time=gen_time)
+                   deterministic=torch.tensor([v.deterministic for v in views]), log=log, gen_time=gen_time,
+                   subsampled=subsampled)
 
 
 class CutGraphPrior(Dataset):
@@ -374,14 +492,18 @@ class CutGraphPrior(Dataset):
     start_step + i // n_groups, whatever the number of workers or the order items are built in
     (`LargestFirstSampler`, `iterate_steps`); a resumed run passes its next step as `start_step` (protocol §6,
     smoke run 3).
+    prior      "carved" or "iid" (`prior_config`); ignored if `cfg` is given
+    subsample  add the subsampled pass to every group (default: stage 1 only, transfer guide §3.9)
     """
 
     def __init__(self, seed: int, stage: int, max_steps: int, start_step: int = 0, R: int = 16,
                  batch_size: int = BATCH_SIZE, group_size: Optional[int] = None,
-                 cfg: Optional[CutGraphConfig] = None):
+                 cfg: Optional[CutGraphConfig] = None, prior: str = "carved", subsample: Optional[bool] = None):
         self.seed, self.stage, self.R = seed, stage, R
         self.start_step, self.max_steps = start_step, max_steps
-        self.cfg = cfg or CutGraphConfig()
+        self.prior = prior if cfg is None else "custom"
+        self.cfg = cfg or prior_config(prior)
+        self.subsample = (stage == 1) if subsample is None else bool(subsample)
         self.group_size = group_size or GROUP_SIZE[stage]
         assert batch_size % self.group_size == 0, "batch_size must be a multiple of the group size"
         self.batch_size, self.n_groups = batch_size, batch_size // self.group_size
@@ -408,12 +530,21 @@ class CutGraphPrior(Dataset):
                 tasks.append(t)
                 idx.append(task_idx)
             out = UQBatch.stack(tasks, self.stage, step, group, idx, log, gen_time=0.0)
+            if self.subsample:
+                n_sub = sample_sub_size(self.seed, key, group, n_ctx)
+                views = []
+                for t, ti in zip(tasks, idx):
+                    with task_rng(self.seed, key, ti, STREAM_SUB_ROWS):
+                        views.append(t.subsampled(n_sub))
+                out.sub = UQBatch.stack(views, self.stage, step, group, idx, RejectionLog(), gen_time=0.0,
+                                        subsampled=True)
         out.gen_time = time.perf_counter() - t0
         return out
 
     def __repr__(self) -> str:
-        return (f"CutGraphPrior(seed={self.seed}, stage={self.stage}, steps=[{self.start_step}, {self.max_steps}), "
-                f"batch_size={self.batch_size}, group_size={self.group_size}, n_groups={self.n_groups}, R={self.R})")
+        return (f"CutGraphPrior(seed={self.seed}, stage={self.stage}, prior={self.prior}, "
+                f"steps=[{self.start_step}, {self.max_steps}), batch_size={self.batch_size}, "
+                f"group_size={self.group_size}, n_groups={self.n_groups}, R={self.R}, subsample={self.subsample})")
 
 
 class LargestFirstSampler(Sampler):

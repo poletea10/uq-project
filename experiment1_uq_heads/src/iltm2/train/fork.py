@@ -1,7 +1,9 @@
-"""The B-job trainer (phase1_protocol.md §3 step 9; design Architecture §4 "Arm B", Training §2-5): one head pair on a
-trainable fork of the last k TFicl blocks, one configuration (head LR x fork LR) per job.
+"""The B-job trainer (phase1_protocol.md §3 step 9; design Architecture §4 "Arm B", Training §2-5; transfer guide
+§3.5-3.6, §4): one head pair on a trainable fork of the last k TFicl blocks, one configuration (head LR x fork LR x
+loss exponent p) per job, since the fork changes the forward pass and p changes the fork's gradients.
 
-    python -m iltm2.train.fork --stage {1,2,3} --seed S --head_lrs H --fork_lr F [options of iltm2.train._config]
+    python -m iltm2.train.fork --stage {1,2,3} --seed S --head_lrs H --fork_lr F --p P [--prior carved|iid]
+        [options of iltm2.train._config]
 
 THE MODEL
     The backbone stays frozen and runs under no_grad; it returns the full residual stream after block 12 - k
@@ -9,11 +11,11 @@ THE MODEL
     blocks 13 - k .. 12 and the final LN, initialized with the pretrained weights) maps it to a new h at the query
     rows, which feeds both heads of one `HeadPair` (arm "B"). The originals keep feeding the decoder, so the PPD,
     e(q) and the targets are exactly those of the A jobs. At step 0 the fork's output equals h_star: B starts where
-    A1 starts (same trunk initialization for the same seed).
+    A starts (same trunk initialization for the same seed).
 
-ONE STEP: as in the A trainer (`frozen.py`), per micro-batch group: backbone forward (no grad), targets, fork forward
-(gradient checkpointing for tasks above --recompute_above rows), heads, loss x the group's share of the step's query
-rows, backward. Then gradient norms (A head, E head, fork), clipping (--clip_per joint: fork + both heads on their
+ONE STEP: as in the A trainer (`frozen.py`), per pass of each micro-batch group (full and, in stage 1, subsampled
+context): backbone forward (no grad), targets, fork forward (gradient checkpointing for tasks above
+--recompute_above rows), heads, the loss with this run's p, x the pass's share of the step's query rows, backward. Then gradient norms (A head, E head, fork), clipping (--clip_per joint: fork + both heads on their
 joint norm, design §6; or separate), and two AdamW optimizers with their own schedules: the heads at head_lr / divisor
 ending at --cosine_lr_end (1e-7), the fork at fork_lr / divisor ending at --fork_cosine_lr_end (1e-8, design §2).
 
@@ -24,7 +26,8 @@ CHECKS AT THE START OF A FRESH STAGE 1 (instead of a separate B smoke job, user'
     Each prints an "OK" line to the job's .out; a failure stops the job (non-zero exit).
 
 LOGGING AND CHECKPOINTS: the pair is named "B", so every B run logs the same keys (B/train/..., B/val/..., B/mini/...)
-and the 9 configurations are told apart by their config and tags (head_lr_*, fork_lr_*). A best-A or best-E
+and the 18 configurations are told apart by their config and tags (head_lr_*, fork_lr_*, p_*, prior_*). The best
+checkpoints are chosen under the run's own weighting (p = 0: val MSE, p = 1: weighted val MSE). A best-A or best-E
 checkpoint stores the whole model (fork + both heads): the heads share the fork, so a configuration is selected as a
 whole (design Training §3), and both heads are logged at every validation, so the trade-off at each best checkpoint
 can be read off the curves.
@@ -41,15 +44,14 @@ from tabicl.prior._dataset import Prior
 
 from iltm2.model._backbone import FrozenBackbone
 from iltm2.model._heads import HEADS, Fork, HeadPair
-from iltm2.prior._cut_graph_scm import CutGraphConfig
-from iltm2.prior._dataset import STAGE_KEY_OFFSET, STAGES, UQBatch, sample_uq_task, stage_step_key
+from iltm2.prior._dataset import STAGE_KEY_OFFSET, STAGES, UQBatch, prior_config, sample_uq_task, stage_step_key
 from iltm2.prior._filter import RejectionLog
 from iltm2.train._base import BaseTrainer, get_scheduler
 from iltm2.train._config import build_parser, finalize
 from iltm2.train._loss import Targets, batch_targets, group_weight, uq_loss
-from iltm2.train._metrics import EMA, train_metrics
+from iltm2.train._metrics import EMA, n_bin_index, train_metrics
 from iltm2.train._validate import BankEvaluator, BestTracker
-from iltm2.train.frozen import TARGET_KEYS, grad_norm
+from iltm2.train.frozen import TARGET_COLS, TARGET_KEYS, grad_norm, n_queries, step_passes, warmup_constants
 
 PAIR = "B"                   # the pair's fixed id: the wandb key prefix of every B run
 FORK_TOL = 1e-5              # step-0 check: max |fork output - h_star|
@@ -62,9 +64,9 @@ class ForkTrainer(BaseTrainer):
 
     def build(self):
         a, dev = self.args, self.device
-        self.backbone = FrozenBackbone(a.backbone_path, a.device, tap_layers=None, fork_k=a.k)
+        self.backbone = FrozenBackbone(a.backbone_path, a.device, fork_k=a.k)
         self.fork = Fork(self.backbone, k=a.k).to(dev)
-        self.pair = HeadPair("B", a.head_lrs[0], a.seed, name=PAIR).to(dev)
+        self.pair = HeadPair("B", a.head_lrs[0], a.seed, p=a.p, name=PAIR).to(dev)
         self.opt_heads = self.pair.make_optimizer(lr=self.pair.lr / a.lr_divisor, weight_decay=a.weight_decay)
         self.opt_fork = torch.optim.AdamW(self.fork.parameters(), lr=a.fork_lr / a.lr_divisor,
                                           weight_decay=a.weight_decay, betas=(0.9, 0.999))
@@ -75,8 +77,8 @@ class ForkTrainer(BaseTrainer):
         self.ema = {k: EMA(0.99) for k in ("xmse_A", "xmse_E")}
         n_fork = sum(p.numel() for p in self.fork.parameters())
         print(f"{self.backbone!r}\nfork: last {a.k} blocks + LN ({n_fork / 1e6:.1f}M parameters), max LR "
-              f"{a.fork_lr / a.lr_divisor:g}; heads: max LR {self.pair.lr / a.lr_divisor:g}; clipping {a.clip_per}",
-              flush=True)
+              f"{a.fork_lr / a.lr_divisor:g}; heads: max LR {self.pair.lr / a.lr_divisor:g}; p {a.p:g}; clipping "
+              f"{a.clip_per}; prior {a.prior}, subsampled pass {a.subsample}", flush=True)
 
     def build_evaluators(self) -> Tuple[BankEvaluator, BankEvaluator]:
         a = self.args
@@ -113,25 +115,21 @@ class ForkTrainer(BaseTrainer):
     def best_payload(self, head_id: str, h: str) -> dict:
         a = self.args
         return dict(pair=self.pair.state_dict(), fork=self.fork.state_dict(), head_id=head_id, which=h, arm="B",
-                    head_lr=a.head_lrs[0], fork_lr=a.fork_lr, k=a.k, seed=a.seed)
+                    head_lr=a.head_lrs[0], fork_lr=a.fork_lr, p=a.p, k=a.k, seed=a.seed, prior=a.prior)
 
     def lrs(self) -> Dict[str, float]:
         return dict(heads=self.opt_heads.param_groups[0]["lr"], fork=self.opt_fork.param_groups[0]["lr"])
 
     # ----- initialization
 
-    def init_output_bias(self, mean_t_A: float, mean_t_E: float):
-        self.pair.init_output_bias(mean_t_A, mean_t_E)
-        print(f"output biases set to the mean targets: t_A {mean_t_A:.5g}, t_E {mean_t_E:.5g}", flush=True)
+    def init_output_bias(self, consts: Dict[str, float]):
+        pre = "w" if self.pair.weighted else ""
+        self.pair.init_output_bias(consts[f"{pre}A"], consts[f"{pre}E"])
+        print(f"output biases set to the {'weighted ' if pre else ''}mean targets: t_A {consts[pre + 'A']:.5g}, "
+              f"t_E {consts[pre + 'E']:.5g}", flush=True)
 
-    @torch.no_grad()
-    def warmup_means(self, groups: List[UQBatch]) -> Tuple[float, float]:
-        sA = sE = n = 0.0
-        for g in groups:
-            g = g.to(self.device, non_blocking=True)
-            T = batch_targets(self.backbone(g.X, g.y_ctx).q, g.y_reps)
-            sA, sE, n = sA + float(T.t_A.sum()), sE + float(T.t_E.sum()), n + T.t_A.numel()
-        return sA / n, sE / n
+    def warmup_means(self, groups: List[UQBatch]) -> Dict[str, float]:
+        return warmup_constants(self.backbone, groups, self.device, self.loss_c)
 
     # ----- startup checks (fresh stage 1)
 
@@ -143,7 +141,7 @@ class ForkTrainer(BaseTrainer):
         if dev.type != "cuda":
             print("preflight memory probe skipped (no GPU)", flush=True)
             return
-        cfg = CutGraphConfig()
+        cfg = prior_config(a.prior)
         st = STAGES[3]
         N = int(st["max_seq_len"])
         n_ctx = int(st["max_train_size"] * N)                 # the largest context TabICLv2's sampler gives
@@ -191,27 +189,28 @@ class ForkTrainer(BaseTrainer):
         print(f"{'OK  ' if ok else 'FAIL'} fork output = h_star at step 0 (first batch, group 0: {g.B} tasks x "
               f"{g.m} queries): max |diff| {diff:.1e} (tolerance {FORK_TOL:g})", flush=True)
         if not ok:
-            raise RuntimeError("the fork does not reproduce h_star at step 0: B would not start where A1 starts")
+            raise RuntimeError("the fork does not reproduce h_star at step 0: B would not start where A starts")
 
     # ----- one step
 
     def train_step(self, groups: List[UQBatch]) -> Dict[str, float]:
         a, dev = self.args, self.device
-        n_step = sum(g.y_reps.shape[0] * g.y_reps.shape[1] for g in groups)
+        passes = step_passes(groups)
+        n_step = sum(n_queries(gp) for gp in passes)
         self.opt_heads.zero_grad(set_to_none=True)
         self.opt_fork.zero_grad(set_to_none=True)
         preds = {h: [] for h in HEADS}
         losses = torch.zeros(3, device=dev)
-        cols = {k: [] for k in ("t_A", "t_E", "t_A_a", "t_A_b", "t_E_a", "t_E_b")}
-        eqs = []
-        for g in groups:
+        cols = {k: [] for k in TARGET_COLS}
+        eqs, nbins = [], []
+        for g in passes:
             g = g.to(dev, non_blocking=True)
             out = self.backbone(g.X, g.y_ctx)
             T = batch_targets(out.q, g.y_reps)
-            w = group_weight(g.y_reps.shape[0] * g.y_reps.shape[1], n_step)
+            w = group_weight(n_queries(g), n_step)
             h = self.fork(out.fork_input, out.train_size, recompute=g.seq_len > a.recompute_above)
             A, E = self.pair(h)
-            lo = uq_loss(A, E, T.t_A, T.t_E, out.e_q, p=a.loss_p, c=a.loss_c, lambda_E=a.lambda_E)
+            lo = uq_loss(A, E, T.t_A, T.t_E, out.e_q, p=self.pair.p, c=self.loss_c, lambda_E=a.lambda_E)
             (lo.loss * w).backward()
             losses += w * torch.stack([lo.loss, lo.loss_A, lo.loss_E]).detach()
             preds["A"].append(A.detach().flatten())
@@ -219,9 +218,11 @@ class ForkTrainer(BaseTrainer):
             for k in cols:
                 cols[k].append(getattr(T, k).flatten())
             eqs.append(out.e_q.flatten())
+            nbins.append(torch.full((n_queries(g),), n_bin_index(g.train_size), device=dev))
             del out, h, A, E, lo
         T_all = Targets(**{k: torch.cat(v) for k, v in cols.items()})
-        m = train_metrics(torch.cat(preds["A"]), torch.cat(preds["E"]), T_all, torch.cat(eqs), prefix=f"{PAIR}/train")
+        m = train_metrics(torch.cat(preds["A"]), torch.cat(preds["E"]), T_all, torch.cat(eqs), prefix=f"{PAIR}/train",
+                          n_bin=torch.cat(nbins))
         logs: Dict[str, float] = {f"train/{k}": m.pop(f"{PAIR}/train/{k}") for k in TARGET_KEYS}
         logs.update(m)
         for h in HEADS:
@@ -243,6 +244,7 @@ class ForkTrainer(BaseTrainer):
         self.sched_heads.step()
         self.sched_fork.step()
         logs[f"{PAIR}/train/fork_dist_from_init"] = self.fork.distance_from_init()
+        logs["train/n_passes"] = float(len(passes))
         if dev.type == "cuda":
             torch.cuda.synchronize()
         return logs

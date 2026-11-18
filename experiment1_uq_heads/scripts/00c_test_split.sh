@@ -6,8 +6,8 @@
 #SBATCH --time=00:30:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
-#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/00c_test_split_%j.out
-#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/00c_test_split_%j.err
+#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/00c_test_split_%j.out
+#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/00c_test_split_%j.err
 
 eval "$(conda shell.bash hook)"
 conda activate uq-iltm-bio

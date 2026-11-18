@@ -1,25 +1,30 @@
 """Inference with a trained iLTMv2 model: TabICLv2's forecast plus the aleatoric (Â) and epistemic (Ê_dir) heads,
-for any query set, from any arm of the ladder (A1, A2, B) and any checkpoint (phase1_design.md Architecture §1, §4).
+for any query set, from either arm (A, B) and any checkpoint (phase1_design.md Architecture §1, §4).
 
     from iltm2.inference import ILTMv2Regressor
 
-    reg = ILTMv2Regressor.from_best("A2")                 # the selected checkpoints of an arm: "A1", "A2", "B"
-                                                          # (BEST, protocol §9.1-9.2)
-    reg = ILTMv2Regressor("runs/A_seed1/stage3/best/A2_lr1e-3_A.pt", "runs/A_seed1/stage3/best/A2_lr1e-3_E.pt")
-    reg = ILTMv2Regressor("runs/A_seed0/stage3/final.pt", pair="A1_lr3e-4")   # both heads of one pair
-    reg = ILTMv2Regressor("runs/B_h3e-4_f1e-5_seed0/stage3/best/B_E.pt")       # B: fork + both heads
+    reg = ILTMv2Regressor.from_best("A")                  # the selected checkpoints of an arm (BEST, filled after the
+                                                          # current round's selection, transfer guide §3.10)
+    reg = ILTMv2Regressor.from_best("B", legacy=True)     # the first round's selected checkpoints (LEGACY_BEST)
+    reg = ILTMv2Regressor("runs/A_carved_seed0/stage3/best/A_lr1e-3_p1_A.pt",
+                          "runs/A_carved_seed0/stage3/best/A_lr1e-3_p1_E.pt")
+    reg = ILTMv2Regressor("runs/A_carved_seed0/stage3/final.pt", pair="A_lr1e-3_p0")   # both heads of one pair
+    reg = ILTMv2Regressor("runs/B_h3e-4_f3e-5_p1_carved_seed0/stage3/best/B_E.pt")     # B: fork + both heads
     reg.fit(X_train, y_train)                             # the context (raw units); nothing is trained
     reg.predict(X_test)                                   # the forecast's mean (like TabICLRegressor.predict)
     out = reg.predict_uncertainty(X_test)                 # {"quantiles", "median", "mean", "A", "E", "e_q"}
 
 CHECKPOINTS (what `checkpoint_A` / `checkpoint_E` may point to)
-    A1 / A2 best files   stage<s>/best/<pair>_A.pt and _E.pt: one head each, so both paths are needed (the best Â
+    A best files         stage<s>/best/<pair>_A.pt and _E.pt: one head each, so both paths are needed (the best Â
                          and the best Ê_dir may come from different configurations, design Training §3)
     B best files         stage<s>/best/B_A.pt or B_E.pt: the whole model (fork + both heads); one path serves both
                          heads. Two different B files give each head its own fork.
-    stage files          stage<s>/final.pt or latest.pt: every pair of the job; A jobs need `pair=` (e.g. A1_lr1e-3)
-    A head's architecture (A1 = trunk on h_star, A2 = layer mix of the 12 taps + trunk, B = fork + trunk) is read
-    from the checkpoint, and the backbone's sha256 must equal the one the checkpoint was trained on.
+    stage files          stage<s>/final.pt or latest.pt: every pair of the job; A jobs need `pair=` (e.g. A_lr1e-3_p1)
+    A head's architecture (A = trunk on h_star, B = fork + trunk) is read from the checkpoint, and the backbone's
+    sha256 must equal the one the checkpoint was trained on. The first round's checkpoints (under
+    iltm2.paths.LEGACY_ROOT) load too: its arm A1 is arm A (same trunk, same state-dict keys) and its B is B. Its arm
+    A2 (a layer mix of 12 residual taps) has no counterpart in this code; it needs the archived repository
+    (transfer guide §6).
 
 THE FORWARD ROUTE (design Architecture §1; protocol §1.3 "Forward route"): one raw TRAINING-MODE forward of the frozen
 TabICLv2 regressor under no_grad, never eval mode and never TabICLRegressor. "Training mode" is only PyTorch's module
@@ -27,7 +32,7 @@ flag: nothing is trained, and dropout is 0. In eval mode tabicl switches to `_in
 (automatic batching, offloading, and mixed precision, use_amp=True by default); TabICLRegressor adds its own
 preprocessing and an ensemble. Both give a different q_theta, while the heads' targets, the validation bank and every
 validation number come from this exact fp32 forecast (Ê_dir is trained to ITS divergence). B's fork (tabicl blocks)
-also runs in training mode, as it did in training and validation; the A1/A2 heads have no mode-dependent layer. The rows are scaled as the training prior scaled them (`iltm2.prior._postprocess`), with the
+also runs in training mode, as it did in training and validation; the A heads have no mode-dependent layer. The rows are scaled as the training prior scaled them (`iltm2.prior._postprocess`), with the
 constants fitted on the CONTEXT only (the residual caveat of design Training §1: at deployment only context labels
 exist): per column, a robust clamp at mean +- 4 std then standardization for X, and the same for y.
 
@@ -51,19 +56,28 @@ from torch import nn
 from iltm2.model._backbone import DEFAULT_BACKBONE, FrozenBackbone
 from iltm2.model._entropy import e_crps
 from iltm2.model._heads import HEADS, Fork, Head
+from iltm2.paths import LEGACY_ROOT
 from iltm2.prior._postprocess import RobustClamp, Standardizer, YTransform
 
-RUNS = Path("/private/groups/ioannidislab/UQ_decoupling_exp/runs")
-# The checkpoints selected on the validation bank (design Training §3-4: per head, the LR with the lowest seed-mean
-# pooled val MSE, then that LR's best seed; protocol §9 "Selected checkpoints"): (Â file, Ê_dir file) per arm.
-BEST = {
-    "A1": (RUNS / "A_seed1/stage3/best/A1_lr1e-3_A.pt", RUNS / "A_seed0/stage3/best/A1_lr1e-3_E.pt"),
-    "A2": (RUNS / "A_seed1/stage3/best/A2_lr1e-3_A.pt", RUNS / "A_seed1/stage3/best/A2_lr1e-3_E.pt"),
-    # B: one configuration chosen as a whole (seed 0 only; provisional until every B run has finished stage 3). Its
-    # best-A and best-E checkpoints are both the end of stage 3, i.e. the same fork + heads state.
-    "B": (RUNS / "B_h3e-4_f3e-5_seed0/stage3/best/B_A.pt", RUNS / "B_h3e-4_f3e-5_seed0/stage3/best/B_E.pt"),
+# The current round's selected checkpoints, (Â file, Ê_dir file) per arm, under iltm2.paths.RUNS_ROOT: filled after the selection
+# of transfer guide §3.10 (step 1: learning rates per cell from validation; step 2: the final model from the tests).
+BEST: Dict[str, Tuple[Path, Path]] = {}
+# The first round's selected checkpoints (transfer guide §6): end of stage 3, first validation bank. Its A1 is arm A.
+LEGACY_RUNS = LEGACY_ROOT / "runs"
+LEGACY_BEST = {
+    "A": (LEGACY_RUNS / "A_seed1/stage3/best/A1_lr1e-3_A.pt", LEGACY_RUNS / "A_seed0/stage3/best/A1_lr1e-3_E.pt"),
+    # B: one configuration chosen as a whole (seed 0); its best-A and best-E files are the same fork + heads state.
+    "B": (LEGACY_RUNS / "B_h3e-4_f3e-5_seed0/stage3/best/B_A.pt", LEGACY_RUNS / "B_h3e-4_f3e-5_seed0/stage3/best/B_E.pt"),
 }
-N_TAPS = 12
+# Arm names in checkpoints: the first round's A1 is arm A; its A2 cannot be loaded here (module docstring).
+_ARM_OF = {"A": "A", "A1": "A", "B": "B"}
+
+
+def _arm(name: str, path) -> str:
+    if name not in _ARM_OF:
+        raise ValueError(f"{path}: arm {name!r} has no counterpart in this code (the first round's A2 needs the "
+                         "archived repository /private/groups/ioannidislab/UQ_project_v1)")
+    return _ARM_OF[name]
 
 
 def _load(path) -> dict:
@@ -82,10 +96,10 @@ class _HeadSpec:
         ck = _load(path)
         self.sha = ck.get("backbone_sha256")
         self.fork_state, self.k = None, None
-        if "head" in ck:                                           # A1 / A2 best file: one head
+        if "head" in ck:                                           # A best file: one head
             assert ck["which"] == h, (f"{path} holds the {ck['which']} head, not {h}: pass the "
                                       f"{'_A' if h == 'A' else '_E'}.pt file")
-            self.arm, self.state = ck["arm"], ck["head"]
+            self.arm, self.state = _arm(ck["arm"], path), ck["head"]
         elif "pair" in ck and "fork" in ck:                        # B best file: fork + both heads
             self.arm, self.state, self.fork_state = "B", _sub_state(ck["pair"], f"{h}."), ck["fork"]
             self.k = int(ck["k"])
@@ -96,13 +110,12 @@ class _HeadSpec:
             else:
                 assert pair is not None and pair in ck["heads"], (
                     f"{path} holds pairs {sorted(ck['heads'])}: choose one with pair=")
-                self.arm, self.state = pair.split("_")[0], _sub_state(ck["heads"][pair], f"{h}.")
+                self.arm, self.state = _arm(pair.split("_")[0], path), _sub_state(ck["heads"][pair], f"{h}.")
         else:
             raise ValueError(f"{path} is not an iLTMv2 Phase-1 checkpoint")
-        assert self.arm in ("A1", "A2", "B"), self.arm
 
     def build(self, backbone: FrozenBackbone, device) -> Tuple[Head, Optional[Fork]]:
-        head = Head(self.arm, n_layers=N_TAPS)
+        head = Head()
         head.load_state_dict(self.state)
         fork = None
         if self.arm == "B":
@@ -118,7 +131,7 @@ class ILTMv2Regressor:
 
     checkpoint_A   checkpoint of the aleatoric head (module docstring, CHECKPOINTS)
     checkpoint_E   checkpoint of the epistemic head (default: checkpoint_A, for files that hold both heads)
-    pair           for an A job's stage file: which pair (e.g. "A2_lr1e-3")
+    pair           for an A job's stage file: which pair (e.g. "A_lr1e-3_p1")
     backbone_path  the frozen TabICLv2 regressor (default: the one the heads were trained on)
     device         "cuda" if available, else "cpu"
     query_chunk    queries per forward
@@ -128,11 +141,9 @@ class ILTMv2Regressor:
                  backbone_path=DEFAULT_BACKBONE, device: Optional[str] = None, query_chunk: int = 4096):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.specs = {"A": _HeadSpec(checkpoint_A, "A", pair), "E": _HeadSpec(checkpoint_E or checkpoint_A, "E", pair)}
-        arms = {s.arm for s in self.specs.values()}
         ks = {s.k for s in self.specs.values() if s.arm == "B"}
         assert len(ks) <= 1, "the two B heads come from forks of different depths"
-        self.backbone = FrozenBackbone(backbone_path, self.device, tap_layers="all" if "A2" in arms else None,
-                                       fork_k=ks.pop() if ks else None)
+        self.backbone = FrozenBackbone(backbone_path, self.device, fork_k=ks.pop() if ks else None)
         for h, s in self.specs.items():
             assert s.sha is None or s.sha == self.backbone.sha256, (
                 f"the {h} head ({s.path}) was trained on another backbone (sha256 {str(s.sha)[:12]}...)")
@@ -144,9 +155,15 @@ class ILTMv2Regressor:
         self.arm = {h: s.arm for h, s in self.specs.items()}
 
     @classmethod
-    def from_best(cls, arm: str, **kw) -> "ILTMv2Regressor":
-        """The selected checkpoints of an arm, "A1", "A2" or "B" (BEST)."""
-        path_A, path_E = BEST[arm]
+    def from_best(cls, arm: str, legacy: bool = False, **kw) -> "ILTMv2Regressor":
+        """The selected checkpoints of an arm, "A" or "B": the current round's (BEST) or the first round's
+        (LEGACY_BEST, legacy=True)."""
+        table = LEGACY_BEST if legacy else BEST
+        if arm not in table:
+            raise KeyError(f"no selected {'legacy ' if legacy else ''}checkpoint for arm {arm!r}"
+                           + ("" if legacy else " yet (BEST is filled after the selection; legacy=True loads the "
+                                                "first round's)"))
+        path_A, path_E = table[arm]
         return cls(path_A, path_E, **kw)
 
     # ----- sklearn-style API
@@ -191,11 +208,8 @@ class ILTMv2Regressor:
             out = self.backbone(rows, self.y_ctx[None])
             fork_h = {}
             for h in HEADS:
-                arm = self.arm[h]
-                if arm == "A1":
+                if self.arm[h] == "A":
                     inp = out.h_star
-                elif arm == "A2":
-                    inp = out.taps
                 else:
                     key = id(self.forks[h])
                     if key not in fork_h:

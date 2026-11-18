@@ -15,12 +15,12 @@ import config
 import toy
 import truth
 
-METHODS = ("hgp", "tabiclv2", "iltmv2", "iltmv2_a1", "iltmv2_b")
-TOY_METHODS = ("hgp", "iltmv2", "iltmv2_a1", "iltmv2_b")   # T1 rows; Dec-ICL joins when its adapter exists
+METHODS = ("hgp", "tabiclv2", "iltmv2", "iltmv2_b")
+TOY_METHODS = ("hgp", "iltmv2", "iltmv2_b")   # T1 rows; Dec-ICL joins when its adapter exists
 TOTAL_ONLY = ("tabiclv2",)        # backbone check only
-# Methods sharing an adapter module, told apart by their configs/methods.yaml entry: iltmv2 = the A2 checkpoints
-# (the paper figure's iLTMv2 column), iltmv2_a1 = the A1 checkpoints, iltmv2_b = the B checkpoint.
-ADAPTER_MODULE = {"iltmv2_a1": "iltmv2", "iltmv2_b": "iltmv2"}
+# Methods sharing an adapter module, told apart by their configs/methods.yaml entry: iltmv2 = arm A's selected
+# checkpoints (the paper figure's iLTMv2 column), iltmv2_b = arm B's.
+ADAPTER_MODULE = {"iltmv2_b": "iltmv2"}
 QUANTILE_LEVELS = (0.05, 0.5, 0.95)
 
 

@@ -9,9 +9,9 @@ levels k/1000, 0 below the first and 1 above the last: the same convention as th
 e_total is that CDF's exact entropy. extras: the quantiles, Â, Ê_dir, iltm2's own e(q_theta) and the amortization
 gap e(q_theta) - Â (proposal §4.7), the y scale and the checkpoints used.
 
-Which model (configs/methods.yaml): `arm` takes that arm's checkpoints selected on the validation bank
-(`iltm2.inference.BEST`, phase1_protocol.md §9); `checkpoint_A` (+ `checkpoint_E`, `pair`) points at any other
-checkpoint, of any arm (A1, A2, B).
+Which model (configs/methods.yaml): `arm` ("A" or "B") takes that arm's checkpoints selected on the validation bank
+(`iltm2.inference.BEST`; with `legacy: true` the first training round's, `LEGACY_BEST`); `checkpoint_A`
+(+ `checkpoint_E`, `pair`) points at any other checkpoint of either arm.
 """
 import time
 
@@ -50,7 +50,7 @@ def regressor(mcfg):
         if mcfg.get("checkpoint_A"):
             reg = ILTMv2Regressor(mcfg["checkpoint_A"], mcfg.get("checkpoint_E"), pair=mcfg.get("pair"), **kw)
         else:
-            reg = ILTMv2Regressor.from_best(mcfg["arm"], **kw)
+            reg = ILTMv2Regressor.from_best(mcfg["arm"], legacy=bool(mcfg.get("legacy", False)), **kw)
         print(f"iLTMv2: {reg!r}", flush=True)
         _REGRESSORS[key] = reg
     return _REGRESSORS[key]

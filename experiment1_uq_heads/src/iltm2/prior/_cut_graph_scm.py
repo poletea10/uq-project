@@ -137,6 +137,11 @@ class CutGraphConfig:
     query_mix: Tuple[float, float, float] = (0.70, 0.15, 0.15)   # [p_iid, p_hole, p_extrap], design §1.3
     region_max_frac: float = 0.2                    # upper bound of the tail size T and hole size k, as a share of N
     dup_fraction: float = 0.05                      # share of query slots overwritten with a context row's x (§1.2)
+    # Thinned regions (transfer guide §3.7): each carved region (tail, hole; drawn independently) is empty with
+    # probability `thin_empty_prob`; otherwise a share rho ~ log-uniform `thin_rho_range` of its non-query rows is
+    # returned to the context (at least one row).
+    thin_empty_prob: float = 0.5
+    thin_rho_range: Tuple[float, float] = (0.05, 0.2)
     # The private roots' noise (U2), calibrated by the difficulty-match gate (design Training §1): their output is
     # multiplied by `private_root_scale` (graph_scm: 1.0), i.e. a smaller node importance, and their number of dims
     # is tabicl's randint(lo, hi, log) over `private_root_dims_range` (hi exclusive; graph_scm: (1, 32)).
@@ -147,6 +152,7 @@ class CutGraphConfig:
 
     def __post_init__(self):
         assert abs(sum(self.query_mix) - 1.0) < 1e-9, "query_mix must sum to 1"
+        assert 0.0 <= self.thin_empty_prob <= 1.0 and 0 < self.thin_rho_range[0] <= self.thin_rho_range[1] < 1
         assert self.prior.ensure_iid, "the cut needs ensure_iid=True (proposal §4.3)"
         assert not self.prior.add_gaussian_noise, "node noise is off in every v2 recipe and is not cached here"
 

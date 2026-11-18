@@ -1,12 +1,16 @@
 #!/bin/bash
-# Smoke run of the A trainer (phase1_protocol.md §6), ONE GPU job, before launching the A jobs:
+# Smoke run of the A trainer (phase1_protocol.md §6; transfer guide §5 Step 2.7), ONE GPU job, before launching the
+# A job:
 #   1. overfit one fixed batch (every head's training MSE must fall to <= 5% of its starting value);
-#   2. stage 1 at real size, 200 steps, stopped after 100 and relaunched (the resume test);
+#   2. stage 1 at real size (both passes: full and subsampled context), 200 steps, stopped after 100 and relaunched
+#      (the resume test);
 #   3. stage 2, 50 steps, from stage 1's final.pt;  4. stage 3, 20 steps at N up to 60K, from stage 2's final.pt;
 #   5. scripts/04b_check_smoke.py: final checkpoints never overwritten, stage chaining, resume continuity (LR,
-#      batches, wandb id), peak GPU memory, projected wall time of a full A job.
-# Stages 1-2 validate on the small smoke bank (fast); stage 3 runs one full validation on the REAL bank, to time it.
-# Logs to the wandb project iLTMv2 as run smoke_A_<jobid>, group 'smoke', tag 'smoke' (filter it out of the real runs;
+#      batches, wandb id), the new slices and both weightings logged, peak GPU memory, projected wall time of a
+#      full A job.
+# Stages 1-2 validate on the small smoke bank (fast); stage 3 caches h_star on the REAL bank and runs one full
+# validation on it, to time both.
+# Logs to the wandb project TabUD as run smoke_A_<jobid>, group 'smoke', tag 'smoke' (filter it out of the real runs;
 # wandb key: ~/.wandb_uq/netrc, see below).
 #   sbatch experiment1_uq_heads/scripts/04_smoke_A.sh
 # The job stops at the first failing part (non-zero exit), so `afterok` dependencies can hang on it.
@@ -16,8 +20,8 @@
 #SBATCH --time=04:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=34
-#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/04_smoke_A_%j.out
-#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/04_smoke_A_%j.err
+#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/04_smoke_A_%j.out
+#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/04_smoke_A_%j.err
 
 eval "$(conda shell.bash hook)"
 conda activate uq-iltm-bio
@@ -31,11 +35,15 @@ if [ -f "$WANDB_NETRC" ]; then export NETRC="$WANDB_NETRC"; else echo "WARNING: 
 set -eo pipefail
 cd /private/home/ajaras/iLTM-bio/UQ_project
 
-ROOT=/private/groups/ioannidislab/UQ_decoupling_exp
+ROOT=/private/groups/ioannidislab/UQ_decoupling_exp_new
 RUN=smoke_A
-SMOKE_BANK=$ROOT/val_bank_smoke
+SMOKE_BANK=$ROOT/val_bank_v2_smoke
 rm -rf "$ROOT/runs/$RUN"                          # a fresh smoke run every time
-TRAIN="python -m iltm2.train.frozen --seed 0 --run_name $RUN --wandb_group smoke --wandb_tags smoke arm_A --wandb_id ${RUN}_${SLURM_JOB_ID:-local}"
+# The weight floor c of the p = 1 pairs, from the REAL bank (val_bank_v2 must exist): every stage uses the same c,
+# as in a real job, although stages 1-2 validate on the smoke bank.
+LOSS_C=$(python -c 'from iltm2.prior._bank import load_manifest; print(load_manifest()["loss_c"])')
+echo "weight floor c = $LOSS_C (val_bank_v2 manifest)"
+TRAIN="python -m iltm2.train.frozen --seed 0 --prior carved --loss_c $LOSS_C --run_name $RUN --wandb_group smoke --wandb_tags smoke arm_A --wandb_id ${RUN}_${SLURM_JOB_ID:-local}"
 
 echo "=== 1. overfit one fixed batch $(date)"
 $TRAIN --overfit_steps 3000 --wandb_log False

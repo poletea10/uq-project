@@ -1,11 +1,11 @@
 #!/bin/bash
-# T1 toy set (hgp; iltmv2, iltmv2_a1 and iltmv2_b, which run on CPU too: 1-D contexts of at most 1,024 rows).
+# T1 toy set (hgp; iltmv2 and iltmv2_b, which run on CPU too: 1-D contexts of at most 1,024 rows).
 #   sbatch --array=0-2 experiment0_baseline/scripts/01_toy.sh --method hgp     # one toy rung per array task
 #   sbatch experiment0_baseline/scripts/01_toy.sh --figures-only               # after all rungs are done
 #   sbatch experiment0_baseline/scripts/01_toy.sh --method hgp                 # all rungs in one job + figures
 #   sbatch experiment0_baseline/scripts/01_toy.sh --method iltmv2 --paper-figure --allow-missing
-#        iLTMv2 (A2 checkpoints), all rungs, per-rung figures + the paper figure (Dec-ICL pending); CPU is enough
-#   sbatch experiment0_baseline/scripts/01_toy.sh --method iltmv2_a1           # the same with the A1 checkpoints
+#        iLTMv2 (arm A checkpoints, configs/methods.yaml), all rungs, per-rung figures + the paper figure (Dec-ICL
+#        pending); CPU is enough
 #   sbatch experiment0_baseline/scripts/01_toy.sh --method iltmv2_b            # the same with the B checkpoint
 #SBATCH --job-name=p0_01_toy
 #SBATCH --partition=medium

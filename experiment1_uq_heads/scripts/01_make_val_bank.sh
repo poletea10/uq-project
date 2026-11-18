@@ -3,7 +3,7 @@
 #   sbatch experiment1_uq_heads/scripts/01_make_val_bank.sh                         # the bank (resumable: relaunch the
 #                                                                                   # same command after a timeout)
 #   sbatch experiment1_uq_heads/scripts/01_make_val_bank.sh --n-tasks 8 4 2 \
-#       --out /private/groups/ioannidislab/UQ_decoupling_exp/val_bank_smoke         # smoke build first
+#       --out /private/groups/ioannidislab/UQ_decoupling_exp_new/val_bank_v2_smoke         # smoke build first
 # CPU workers generate the tasks (R_val = 128 replicate passes each), the GPU computes the forecast targets.
 # A5500 = the 24 GB card training will run on: the bank's targets must come from the training GPU's forward.
 #SBATCH --job-name=p1_01_make_val_bank
@@ -12,8 +12,8 @@
 #SBATCH --time=2-00:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=34
-#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/01_make_val_bank_%j.out
-#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp/slurm_logs/01_make_val_bank_%j.err
+#SBATCH --output=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/01_make_val_bank_%j.out
+#SBATCH --error=/private/groups/ioannidislab/UQ_decoupling_exp_new/slurm_logs/01_make_val_bank_%j.err
 
 eval "$(conda shell.bash hook)"
 conda activate uq-iltm-bio

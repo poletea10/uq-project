@@ -9,7 +9,7 @@ WHAT IS TESTED
                            t_A, t_E of design §2 and their half-split versions used by xMSE (protocol §7.3).
 
 HOW
-    The estimators themselves were validated in Phase 0 (phase0_protocol.md §10, gotcha 1), so they are not
+    The estimators themselves were validated in Phase 0 (phase0_protocol.md §12, gotcha 1), so they are not
     re-audited for bias here (one exception: section 4 checks the one property xMSE relies on). What is new is
     the torch implementation, and the reference is Phase 0's numpy code, imported from experiment0_baseline/src:
       - entropy.quantile_entropy: Phase 0's exact segment-wise e_CRPS. Both sides are exact closed forms, so
